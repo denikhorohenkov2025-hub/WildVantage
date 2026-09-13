@@ -222,6 +222,9 @@ MDBoxLayout:
                 text_color: 0.6, 0.9, 0.6, 1
             MDList:
                 id: data_list
+                spacing: dp(8)
+                size_hint_y: None
+                height: self.minimum_height
 """
 
 
@@ -236,6 +239,8 @@ class WildVantage(MDApp):
         self.is_wilderness = False
         self.current_lat = None
         self.current_lon = None
+        self._last_az = 0
+        self._compass_restart_ts = 0
 
         return Builder.load_string(KV)
 
@@ -305,6 +310,9 @@ class WildVantage(MDApp):
             val = compass.field
             if not val:
                 return
+            from time import time
+
+            self._last_az = time()
             bearing = (math.degrees(math.atan2(val[1], val[0])) + 360) % 360
             idx = int((bearing + 22.5) // 45) % 8
             self.root.ids.azimuth_label.text = (
@@ -332,7 +340,23 @@ class WildVantage(MDApp):
             pass
 
     # --- GPS ---
+    # Если азимут отсутствует/завис — попытка перезапустить компас при обновлении GPS
+    def _ensure_compass(self):
+        if compass is None:
+            return
+        from time import time
+
+        stale = (time() - self._last_az) > 5
+        avoid_spam = (time() - self._compass_restart_ts) > 10
+        if (self._last_az == 0 or stale) and avoid_spam:
+            self._compass_restart_ts = time()
+            try:
+                compass.enable()
+            except Exception:
+                pass
+
     def start_gps(self, *args):
+        self._ensure_compass()
         self._set_status("📡 Поиск спутников (в лесу до 2-х минут)...")
         if gps is None:
             self._set_status("GPS недоступен")
@@ -382,13 +406,14 @@ class WildVantage(MDApp):
             tz_offset = self.estimate_timezone(lon)
             with open(CACHE_FILE, "r") as f:
                 cache = json.load(f)
-            forecasts = self._nearest_noon(cache.get("list", []))
-            if forecasts:
+            days = self._daily_extremes(cache.get("list", []))
+            if days:
                 self.root.ids.temp_label.text = (
-                    f"{int(forecasts[0]['main']['temp'])}°C"
+                    f"{int(days[0]['tmax'])}° / {int(days[0]['tmin'])}°"
                 )
-                for rec in forecasts:
-                    self._add_forecast_row(rec, lat, lon, tz_offset)
+                self.root.ids.temp_label.font_size = sp(46)
+                for day in days:
+                    self._add_forecast_row(day, lat, lon, tz_offset)
         except Exception:
             pass
         self._set_status("✅ Спутники: OK | Погода: Офлайн")
@@ -577,6 +602,31 @@ class WildVantage(MDApp):
         except Exception:
             return []
 
+    # --- ГРУППИРОВКА ПО ДНЯМ: МАКС/МИН температуры за сутки ---
+    def _daily_extremes(self, forecast_list):
+        try:
+            days = {}
+            for f in forecast_list:
+                if "dt" not in f or "main" not in f:
+                    continue
+                dt = datetime.fromtimestamp(f["dt"])
+                days.setdefault(dt.date(), []).append(f)
+            result = []
+            for day in sorted(days):
+                entries = days[day]
+                tmax = max(e["main"].get("temp_max", e["main"].get("temp"))
+                           for e in entries)
+                tmin = min(e["main"].get("temp_min", e["main"].get("temp"))
+                           for e in entries)
+                exact = [e for e in entries if "12:00:00" in e.get("dt_txt", "")]
+                rep = exact[0] if exact else min(
+                    entries, key=lambda e: abs(
+                        datetime.fromtimestamp(e["dt"]).hour - 12))
+                result.append({"date": day, "tmax": tmax, "tmin": tmin, "rep": rep})
+            return result
+        except Exception:
+            return []
+
     # --- ОБНОВЛЕНИЕ ИНТЕРФЕЙСА ---
     def refresh_ui(self, data, cache=False):
         try:
@@ -591,6 +641,7 @@ class WildVantage(MDApp):
             )
             forecasts = self._nearest_noon(data.get("list", []))
             if forecasts:
+                self.root.ids.temp_label.font_size = sp(56)
                 self.root.ids.temp_label.text = f"{int(forecasts[0]['main']['temp'])}°C"
                 self._set_status(
                     f"Обновлено: {data.get('saved_at', 'Неизвестно')}"
@@ -605,28 +656,29 @@ class WildVantage(MDApp):
             self.root.ids.sr_label.text = sunrise
             self.root.ids.ss_label.text = sunset
 
-            if not forecasts:
+            days = self._daily_extremes(data.get("list", []))
+            if not days:
                 return
-            for f in forecasts:
-                self._add_forecast_row(f, lat, lon, tz_offset)
+            for day in days:
+                self._add_forecast_row(day, lat, lon, tz_offset)
         except Exception:
             self._set_status("Ошибка отображения данных")
             self.load_from_cache()
 
-    # --- СТРОКА ПРОГНОЗА: дата/температура + иконки солнца ---
-    def _add_forecast_row(self, f, lat, lon, tz_offset):
+    # --- СТРОКА ПРОГНОЗА: дата, МАКС°/МИН°, иконки солнца ---
+    def _add_forecast_row(self, day, lat, lon, tz_offset):
         try:
-            dt = datetime.fromtimestamp(f["dt"])
+            rep = day["rep"]
+            dt = datetime.fromtimestamp(rep["dt"])
             sr, ss = self.local_sun_times(lat, lon, tz_offset, dt.date())
-            description = f["weather"][0]["description"]
-            temp = f["main"]["temp"]
+            description = rep["weather"][0]["description"]
 
             row = MDCard(
                 orientation="horizontal",
                 size_hint_y=None,
-                height=dp(84),
-                padding=[dp(12), dp(8)],
-                spacing=dp(8),
+                height=dp(92),
+                padding=[dp(14), dp(10)],
+                spacing=dp(10),
                 radius=[dp(14),],
                 elevation=0,
                 md_bg_color=(0.11, 0.16, 0.11, 1),
@@ -634,15 +686,19 @@ class WildVantage(MDApp):
             )
             row.add_widget(MDIcon(
                 icon=self.weather_icon(description),
-                font_size="28sp",
+                font_size="30sp",
                 theme_text_color="Custom",
                 text_color=(0.75, 1, 0.75, 1),
             ))
 
-            col = BoxLayout(orientation="vertical", spacing=dp(2))
+            col = BoxLayout(orientation="vertical", spacing=dp(4))
             col.add_widget(MDLabel(
-                text=f"{dt.strftime('%d.%m')} | {int(temp)}°C  ·  {description.capitalize()}",
-                font_size=sp(17),
+                text=(
+                    f"{dt.strftime('%d.%m')}  |  "
+                    f"{int(day['tmax'])}° / {int(day['tmin'])}°"
+                    f"  ·  {description.capitalize()}"
+                ),
+                font_size=sp(19),
                 bold=True,
                 theme_text_color="Custom",
                 text_color=(0.9, 1, 0.9, 1),
