@@ -20,7 +20,7 @@ try:
 except Exception:
     requests = None
 
-gps = compass = barometer = None
+gps = compass = None
 
 API_KEY = "5dfb720a2f0c5b0c7d131f88236baecf"
 CACHE_FILE = "wildvantage_v2.json"
@@ -65,110 +65,64 @@ MDBoxLayout:
             size_hint_y: None
             height: self.minimum_height
 
+            # Режим Глуши + поле поиска: вертикально друг под другом
             MDBoxLayout:
-                id: sensors_row
+                orientation: "vertical"
                 adaptive_height: True
-                spacing: dp(10)
+                spacing: dp(20)
+                padding: dp(10)
 
                 MDCard:
-                    orientation: "vertical"
-                    size_hint_x: 0.5
-                    size_hint_y: None
-                    height: dp(108)
-                    padding: dp(10)
-                    radius: [dp(14),]
+                    orientation: "horizontal"
+                    adaptive_height: True
+                    padding: dp(14), dp(4)
+                    radius: [dp(12),]
                     elevation: 0
                     md_bg_color: 0.12, 0.18, 0.12, 1
                     line_color: 0.2, 0.4, 0.2, 1
                     MDLabel:
-                        id: compass_label
-                        text: "КОМПАС: --°"
-                        halign: "center"
-                        font_style: "H6"
+                        id: mode_text
+                        text: "Режим: Город (Online)"
                         bold: True
                         theme_text_color: "Custom"
-                        text_color: 0.9, 1, 0.9, 1
-                    MDLabel:
-                        id: direction_label
-                        text: "Направление: --"
-                        halign: "center"
-                        theme_text_color: "Custom"
-                        text_color: 0.6, 0.8, 0.6, 1
+                        text_color: 0.85, 1, 0.85, 1
+                    Widget:
+                    MDSwitch:
+                        id: mode_switch
+                        active: False
+                        on_active: app.toggle_mode(*args)
 
                 MDCard:
-                    orientation: "vertical"
-                    size_hint_x: 0.5
-                    size_hint_y: None
-                    height: dp(108)
-                    padding: dp(10)
-                    radius: [dp(14),]
+                    orientation: "horizontal"
+                    adaptive_height: True
+                    padding: dp(14), dp(4)
+                    radius: [dp(12),]
                     elevation: 0
                     md_bg_color: 0.12, 0.18, 0.12, 1
                     line_color: 0.2, 0.4, 0.2, 1
-                    MDLabel:
-                        id: pressure_label
-                        text: "ДАВЛЕНИЕ: НЕТ"
-                        halign: "center"
-                        font_style: "H6"
-                        bold: True
-                        theme_text_color: "Custom"
-                        text_color: 0.9, 1, 0.9, 1
-                    MDLabel:
-                        id: pressure_hint
-                        text: "Барометр"
-                        halign: "center"
-                        theme_text_color: "Custom"
-                        text_color: 0.6, 0.8, 0.6, 1
+                    MDTextField:
+                        id: search_field
+                        hint_text: "Введите город"
+                        size_hint_x: 1
+                        size_hint_y: None
+                        height: dp(48)
+                        mode: "fill"
+                        fill_color_normal: 0.08, 0.12, 0.08, 1
+                        fill_color_focus: 0.08, 0.12, 0.08, 1
+                    MDIconButton:
+                        icon: "magnify"
+                        on_release: app.search_city()
+                        theme_icon_color: "Custom"
+                        icon_color: 0.6, 0.9, 0.6, 1
 
+            # Главная карточка: город, координаты, азимут, температура, солнце
             MDCard:
-                orientation: "horizontal"
-                adaptive_height: True
-                padding: dp(14), dp(4)
-                radius: [dp(12),]
-                elevation: 0
-                md_bg_color: 0.12, 0.18, 0.12, 1
-                line_color: 0.2, 0.4, 0.2, 1
-                MDLabel:
-                    id: mode_text
-                    text: "РЕЖИМ: ГОРОД (ONLINE)"
-                    bold: True
-                    theme_text_color: "Custom"
-                    text_color: 0.85, 1, 0.85, 1
-                Widget:
-                MDSwitch:
-                    id: mode_switch
-                    active: False
-                    on_active: app.toggle_mode(*args)
-
-            MDCard:
-                orientation: "horizontal"
-                adaptive_height: True
-                padding: dp(14), dp(4)
-                radius: [dp(12),]
-                elevation: 0
-                md_bg_color: 0.12, 0.18, 0.12, 1
-                line_color: 0.2, 0.4, 0.2, 1
-                MDTextField:
-                    id: search_field
-                    hint_text: "Название города"
-                    size_hint_x: 1
-                    size_hint_y: None
-                    height: dp(48)
-                    mode: "fill"
-                    fill_color_normal: 0.08, 0.12, 0.08, 1
-                    fill_color_focus: 0.08, 0.12, 0.08, 1
-                MDIconButton:
-                    icon: "magnify"
-                    on_release: app.search_city()
-                    theme_icon_color: "Custom"
-                    icon_color: 0.6, 0.9, 0.6, 1
-
-            MDCard:
+                id: info_card
                 orientation: "vertical"
                 size_hint_y: None
-                height: dp(210)
+                height: dp(310)
                 padding: dp(16)
-                spacing: dp(4)
+                spacing: dp(6)
                 radius: [dp(18),]
                 elevation: 0
                 md_bg_color: 0.12, 0.18, 0.12, 1
@@ -181,6 +135,13 @@ MDBoxLayout:
                     theme_text_color: "Custom"
                     text_color: 0.9, 1, 0.9, 1
                 MDLabel:
+                    id: azimuth_label
+                    text: "Азимут: --"
+                    halign: "center"
+                    font_size: sp(16)
+                    theme_text_color: "Custom"
+                    text_color: 0.6, 0.8, 0.6, 1
+                MDLabel:
                     id: temp_label
                     text: "--°C"
                     halign: "center"
@@ -189,14 +150,21 @@ MDBoxLayout:
                     theme_text_color: "Custom"
                     text_color: 0.95, 1, 0.95, 1
                 MDLabel:
+                    id: sun_label
+                    text: "🌅 --:--    🌇 --:--"
+                    halign: "center"
+                    font_size: sp(17)
+                    theme_text_color: "Custom"
+                    text_color: 0.75, 1, 0.75, 1
+                MDLabel:
                     id: status_label
                     text: "Загрузка..."
                     halign: "center"
+                    font_size: sp(13)
                     theme_text_color: "Custom"
-                    text_color: 0.6, 0.8, 0.6, 1
+                    text_color: 0.55, 0.75, 0.55, 1
                 MDFillRoundFlatButton:
-                    text: "ОБНОВИТЬ GPS КООРДИНАТЫ"
-                    pos_hint: {"center_x": 0.5}
+                    text: "Обновить GPS"
                     md_bg_color: 0.2, 0.4, 0.2, 1
                     on_release: app.start_gps()
 
@@ -225,7 +193,7 @@ class WildVantage(MDApp):
 
         return Builder.load_string(KV)
 
-    # --- Safe Boot: каркас UI уже показан, все датчики/разрешения — через 2 сек ---
+    # --- Safe Boot: каркас UI уже показан, датчики/разрешения — через 2 сек ---
     def delayed_init(self, *args):
         self._set_status("Проверка датчиков и разрешений...")
         self._import_sensors()
@@ -240,15 +208,11 @@ class WildVantage(MDApp):
             pass
 
     def _import_sensors(self):
-        global gps, compass, barometer
+        global gps, compass
         try:
             from plyer import compass
         except Exception:
             compass = None
-        try:
-            from plyer import barometer
-        except Exception:
-            barometer = None
         try:
             from plyer import gps
         except Exception:
@@ -271,34 +235,20 @@ class WildVantage(MDApp):
         except Exception:
             pass
 
-    # --- ДАТЧИКИ ---
+    # --- КОМПАС ---
     def start_sensors(self):
         if compass is None:
-            self._no_sensor("compass")
+            self._no_compass()
         else:
             try:
                 compass.enable()
                 Clock.schedule_interval(self.update_compass, 1 / 10)
             except Exception:
-                self._no_sensor("compass")
+                self._no_compass()
 
-        if barometer is None:
-            self._no_sensor("barometer")
-        else:
-            try:
-                barometer.enable()
-                Clock.schedule_interval(self.update_barometer, 1)
-            except Exception:
-                self._no_sensor("barometer")
-
-    def _no_sensor(self, which):
+    def _no_compass(self):
         try:
-            if "compass" in str(which):
-                self.root.ids.compass_label.text = "КОМПАС: --°"
-                self.root.ids.direction_label.text = "Нет датчика"
-            else:
-                self.root.ids.pressure_label.text = "ДАВЛЕНИЕ: НЕТ"
-                self.root.ids.pressure_hint.text = "Нет датчика"
+            self.root.ids.azimuth_label.text = "Азимут: --"
         except Exception:
             pass
 
@@ -310,21 +260,12 @@ class WildVantage(MDApp):
             if not val:
                 return
             bearing = (math.degrees(math.atan2(val[1], val[0])) + 360) % 360
-            self.root.ids.compass_label.text = f"КОМПАС: {int(bearing)}°"
             idx = int((bearing + 22.5) // 45) % 8
-            self.root.ids.direction_label.text = DIRECTIONS[idx]
+            self.root.ids.azimuth_label.text = (
+                f"Азимут: {int(bearing)}° ({DIRECTIONS[idx]})"
+            )
         except Exception:
             pass
-
-    def update_barometer(self, dt):
-        if barometer is None:
-            return
-        try:
-            pressure = barometer.pressure
-            if pressure:
-                self.root.ids.pressure_label.text = f"ДАВЛЕНИЕ: {int(pressure)} гПа"
-        except Exception:
-            self.root.ids.pressure_label.text = "ДАВЛЕНИЕ: НЕТ"
 
     # --- ПЕРЕКЛЮЧЕНИЕ РЕЖИМА ---
     def toggle_mode(self, instance, value):
@@ -332,12 +273,12 @@ class WildVantage(MDApp):
         try:
             root = self.root.ids
             if value:
-                root.mode_text.text = "РЕЖИМ: ГЛУШЬ (OFFLINE)"
+                root.mode_text.text = "Режим: Глушь (Offline)"
                 root.mode_text.text_color = 1, 0.4, 0.4, 1
                 root.header.md_bg_color = 0.15, 0.05, 0.05, 1
                 root.search_field.disabled = True
             else:
-                root.mode_text.text = "РЕЖИМ: ГОРОД (ONLINE)"
+                root.mode_text.text = "Режим: Город (Online)"
                 root.mode_text.text_color = 0.85, 1, 0.85, 1
                 root.header.md_bg_color = 0.08, 0.12, 0.08, 1
                 root.search_field.disabled = False
@@ -368,13 +309,13 @@ class WildVantage(MDApp):
         else:
             self.fetch_weather_by_coords(self.current_lat, self.current_lon)
 
-    # --- ПОИСК ГОРОДА (онлайн) ---
+    # --- ПОИСК ГОРОДА (онлайн, с кириллицей) ---
     def search_city(self, *args):
         if self.is_wilderness:
             return
         city = self.root.ids.search_field.text.strip()
         if not city:
-            self._set_status("Введите название города")
+            self._set_status("Введите город")
             return
         if requests is None:
             self._set_status("Нет сети — данные из кэша")
@@ -382,9 +323,11 @@ class WildVantage(MDApp):
             return
         self._set_status("Поиск города...")
         try:
+            from urllib.parse import quote
+
             geo_url = (
                 f"https://api.openweathermap.org/geo/1.0/direct"
-                f"?q={city}&limit=1&appid={self.api_key}"
+                f"?q={quote(city)}&limit=1&appid={self.api_key}"
             )
             r = requests.get(geo_url, timeout=5)
             if r.status_code == 401:
@@ -441,18 +384,9 @@ class WildVantage(MDApp):
                 data["city"]["name"] = "Точка GPS"
                 if "timezone" not in data["city"]:
                     data["city"]["timezone"] = self.estimate_timezone(new_lon)
-                self._sun_times_for_cache(data, new_lat, new_lon)
             self.refresh_ui(data, cache=True)
         except Exception:
             self._set_status("Нет данных (кэш пуст)")
-
-    def _sun_times_for_cache(self, data, lat, lon):
-        try:
-            date = datetime.now().date()
-            sr, ss = self.local_sun_times(lat, lon, self.estimate_timezone(lon), date)
-            data["city"]["name"] = f"Точка GPS (Вс {sr} / Зх {ss})"
-        except Exception:
-            pass
 
     def estimate_timezone(self, lon):
         try:
@@ -510,7 +444,9 @@ class WildVantage(MDApp):
             lon = data["city"]["coord"]["lon"]
             tz_offset = data["city"].get("timezone", self.estimate_timezone(lon))
 
-            self.root.ids.loc_label.text = f"{data['city']['name']}\n{lat:.4f}, {lon:.4f}"
+            self.root.ids.loc_label.text = (
+                f"{data['city']['name']}\n{lat:.4f}, {lon:.4f}"
+            )
             forecasts = self._nearest_noon(data["list"])
             self.root.ids.temp_label.text = f"{int(forecasts[0]['main']['temp'])}°C"
             self._set_status(
@@ -518,15 +454,19 @@ class WildVantage(MDApp):
                 + ("  (кэш)" if cache else "")
             )
 
+            today = datetime.now().date()
+            sunrise, sunset = self.local_sun_times(lat, lon, tz_offset, today)
+            self.root.ids.sun_label.text = f"🌅 {sunrise}    🌇 {sunset}"
+
             for f in forecasts:
                 dt = datetime.fromtimestamp(f["dt"])
-                sunrise, sunset = self.local_sun_times(lat, lon, tz_offset, dt.date())
+                sr, ss = self.local_sun_times(lat, lon, tz_offset, dt.date())
                 description = f["weather"][0]["description"]
 
                 item = ThreeLineIconListItem(
                     text=f"{dt.strftime('%d.%m')} | {int(f['main']['temp'])}°C",
                     secondary_text=description.capitalize(),
-                    tertiary_text=f"Восход: {sunrise}  |  Закат: {sunset}",
+                    tertiary_text=f"Восход: {sr}  |  Закат: {ss}",
                 )
                 item.add_widget(IconLeftWidget(icon=self.weather_icon(description)))
                 self.root.ids.data_list.add_widget(item)
