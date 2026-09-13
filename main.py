@@ -5,6 +5,7 @@ from datetime import datetime
 from kivy.clock import Clock
 from kivy.lang import Builder
 from kivy.metrics import dp, sp
+from kivy.network.urlrequest import UrlRequest
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.widget import Widget
 from kivy.utils import platform
@@ -19,9 +20,9 @@ from kivymd.uix.selectioncontrol import MDSwitch
 from kivymd.uix.textfield import MDTextField
 
 try:
-    import requests
+    import certifi
 except Exception:
-    requests = None
+    certifi = None
 
 gps = compass = None
 
@@ -332,7 +333,7 @@ class WildVantage(MDApp):
 
     # --- GPS ---
     def start_gps(self, *args):
-        self._set_status("Поиск спутников...")
+        self._set_status("📡 Поиск спутников (в лесу до 2-х минут)...")
         if gps is None:
             self._set_status("GPS недоступен")
             return
@@ -354,9 +355,10 @@ class WildVantage(MDApp):
         if not lat or not lon:
             self._set_status("GPS: координаты не получены")
             return
-        self._show_offline_point(lat, lon)
         if self.is_wilderness:
+            self._gps_offline(lat, lon)
             return
+        self._show_offline_point(lat, lon)
         self.fetch_weather_by_coords(lat, lon, gps_mode=True)
 
     # Точка GPS: сразу координаты + солнце (офлайн, без ожидания API)
@@ -370,9 +372,44 @@ class WildVantage(MDApp):
             self.root.ids.sr_label.text = sr
             self.root.ids.ss_label.text = ss
             self.root.ids.data_list.clear_widgets()
-            self._set_status("Спутники: ОК | Погода: запрос...")
         except Exception:
-            self._set_status("GPS: ошибка отображения точки")
+            pass
+
+    # Режим «Глушь»: мгновенно точка+солнце, температура строго из кэша, ноль запросов
+    def _gps_offline(self, lat, lon):
+        self._show_offline_point(lat, lon)
+        try:
+            tz_offset = self.estimate_timezone(lon)
+            with open(CACHE_FILE, "r") as f:
+                cache = json.load(f)
+            forecasts = self._nearest_noon(cache.get("list", []))
+            if forecasts:
+                self.root.ids.temp_label.text = (
+                    f"{int(forecasts[0]['main']['temp'])}°C"
+                )
+                for rec in forecasts:
+                    self._add_forecast_row(rec, lat, lon, tz_offset)
+        except Exception:
+            pass
+        self._set_status("✅ Спутники: OK | Погода: Офлайн")
+
+    # --- АСИНХРОННЫЙ HTTP (UrlRequest, не блокирует интерфейс) ---
+    def _request_json(self, url, on_success, on_http, on_error):
+        self._set_status("⏳ Загрузка прогноза...")
+        kwargs = {}
+        if certifi is not None:
+            kwargs["ca_file"] = certifi.where()
+        try:
+            UrlRequest(
+                url,
+                on_success=on_success,
+                on_failure=on_http,
+                on_error=on_error,
+                verify=True,
+                **kwargs,
+            )
+        except Exception:
+            on_error(None, Exception("http init"))
 
     # --- ПОИСК ГОРОДА (онлайн, с кириллицей) ---
     def search_city(self, *args):
@@ -382,76 +419,87 @@ class WildVantage(MDApp):
         if not city:
             self._set_status("Введите город")
             return
-        if requests is None:
-            self._set_status("Нет сети — данные из кэша")
-            self.load_from_cache()
-            return
-        self._set_status("Поиск города...")
-        try:
-            from urllib.parse import quote
+        from urllib.parse import quote
 
-            geo_url = (
-                f"https://api.openweathermap.org/geo/1.0/direct"
-                f"?q={quote(city)}&limit=1&appid={self.api_key}"
-            )
-            r = requests.get(geo_url, timeout=5)
-            if r.status_code == 401:
-                self._set_status("Ошибка ключа (401) — данные из кэша")
-                self.load_from_cache()
-                return
-            if r.status_code == 200 and r.json():
-                loc = r.json()[0]
-                self.current_lat = loc["lat"]
-                self.current_lon = loc["lon"]
-                self.fetch_weather_by_coords(loc["lat"], loc["lon"])
-            else:
+        url = (
+            f"https://api.openweathermap.org/geo/1.0/direct"
+            f"?q={quote(city)}&limit=1&appid={self.api_key}"
+        )
+
+        def success(request, result):
+            try:
+                if isinstance(result, list) and result:
+                    loc = result[0]
+                    self.current_lat = loc["lat"]
+                    self.current_lon = loc["lon"]
+                    self.fetch_weather_by_coords(loc["lat"], loc["lon"])
+                else:
+                    self._set_status("Город не найден")
+            except Exception:
                 self._set_status("Город не найден")
-        except Exception:
+
+        def http_error(request, _body):
+            status = getattr(request, "resp_status", None)
+            if status == 401:
+                self._set_status("Ошибка ключа (401) — данные из кэша")
+            else:
+                self._set_status("API ошибка — город не найден")
+            self.load_from_cache()
+
+        def net_error(_request, _error):
             self._set_status("Нет сети — данные из кэша")
             self.load_from_cache()
+
+        self._request_json(url, success, http_error, net_error)
 
     # --- ПОГОДА (онлайн) ---
     def fetch_weather_by_coords(self, lat, lon, gps_mode=False):
-        if requests is None:
-            if gps_mode:
-                self._set_status("Спутники: ОК | Погода: Нет сети")
-            else:
-                self._set_status("Нет сети — данные из кэша")
-                self.load_from_cache()
-            return
-        try:
-            url = (
-                f"https://api.openweathermap.org/data/2.5/forecast"
-                f"?lat={lat}&lon={lon}&appid={self.api_key}&units=metric&lang=ru"
-            )
-            r = requests.get(url, timeout=5)
-            if r.status_code == 401:
+        url = (
+            f"https://api.openweathermap.org/data/2.5/forecast"
+            f"?lat={lat}&lon={lon}&appid={self.api_key}&units=metric&lang=ru"
+        )
+
+        def success(request, result):
+            try:
+                if not isinstance(result, dict) or "city" not in result:
+                    raise ValueError("bad json")
+                data = result
+                data["saved_at"] = datetime.now().strftime("%d.%m %H:%M")
+                with open(CACHE_FILE, "w") as f:
+                    json.dump(data, f)
+                self.refresh_ui(data)
+            except Exception:
+                if gps_mode:
+                    self._set_status("Спутники: ОК | Погода: Ошибка данных")
+                else:
+                    self._set_status("Ошибка данных — из кэша")
+                    self.load_from_cache()
+
+        def http_error(request, _body):
+            status = getattr(request, "resp_status", None)
+            if status == 401:
                 if gps_mode:
                     self._set_status("Спутники: ОК | Погода: Ожидание API (401)")
                 else:
                     self._set_status("Ошибка ключа (401) — данные из кэша")
                     self.load_from_cache()
-                return
-            if r.status_code == 200:
-                data = r.json()
-                data["saved_at"] = datetime.now().strftime("%d.%m %H:%M")
-                with open(CACHE_FILE, "w") as f:
-                    json.dump(data, f)
-                self.refresh_ui(data)
             else:
                 if gps_mode:
                     self._set_status(
-                        f"Спутники: ОК | Погода: API ошибка ({r.status_code})"
+                        f"Спутники: ОК | Погода: API ошибка ({status})"
                     )
                 else:
                     self._set_status("API ошибка — данные из кэша")
                     self.load_from_cache()
-        except Exception:
+
+        def net_error(_request, _error):
             if gps_mode:
                 self._set_status("Спутники: ОК | Погода: Нет сети")
             else:
                 self._set_status("Нет сети — данные из кэша")
                 self.load_from_cache()
+
+        self._request_json(url, success, http_error, net_error)
 
     # --- УМНЫЙ КЭШ ---
     def load_from_cache(self, new_lat=None, new_lon=None):

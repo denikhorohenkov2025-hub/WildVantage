@@ -13,13 +13,13 @@ source.include_exts = py,png,jpg,kv,atlas,json
 # Можно поднять при релизе
 version = 0.1.0
 
-requirements = python3,kivy==2.2.1,kivymd==1.1.1,requests,astral,plyer,pytz,urllib3,idna,certifi,charset-normalizer,typing_extensions,pillow
+requirements = python3,kivy==2.2.1,kivymd==1.1.1,astral,plyer,pytz,pillow,urllib3,certifi
 
 orientation = portrait
 
 fullscreen = 0
 
-android.permissions = INTERNET, ACCESS_NETWORK_STATE, ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION, ACCESS_WIFI_STATE
+android.permissions = INTERNET, ACCESS_NETWORK_STATE, ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION
 
 android.api = 31
 
