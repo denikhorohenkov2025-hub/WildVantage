@@ -561,19 +561,21 @@ class WildVantage(MDApp):
         except Exception:
             return "--:--", "--:--"
 
-    # --- ДИНАМИЧЕСКАЯ ИКОНКА ПОГОДЫ ---
-    def weather_icon(self, description):
+    # --- УМНЫЕ ИКОНКИ ПОГОДЫ (keyword mapping по русскому описанию) ---
+    def get_weather_icon(self, description):
         d = description.lower()
-        if any(w in d for w in ("гроза", "storm", "lightning")):
-            return "weather-lightning"
+        if any(w in d for w in ("гроз", "lightning", "thunder")):
+            return "weather-lightning-rainy"
         if any(w in d for w in ("снег", "snow")):
             return "weather-snowy"
-        if any(w in d for w in ("дождь", "ливень", "rain", "drizzle")):
+        if any(w in d for w in ("дожд", "ливень", "морось", "drizzle", "rain")):
             return "weather-rainy"
         if any(w in d for w in ("туман", "дымка", "fog", "mist", "пыль", "haze")):
             return "weather-fog"
-        if any(w in d for w in ("облач", "cloud")):
+        if any(w in d for w in ("облач", "пасмур", "перемен", "cloud")):
             return "weather-cloudy"
+        if any(w in d for w in ("ясно", "солн", "clear")):
+            return "weather-sunny"
         return "weather-sunny"
 
     # --- ФИЛЬТР: ОДНА ЗАПИСЬ НА 12:00 КАЖДОГО ДНЯ ---
@@ -685,7 +687,7 @@ class WildVantage(MDApp):
                 line_color=(0.2, 0.4, 0.2, 1),
             )
             row.add_widget(MDIcon(
-                icon=self.weather_icon(description),
+                icon=self.get_weather_icon(description),
                 font_size="30sp",
                 theme_text_color="Custom",
                 text_color=(0.75, 1, 0.75, 1),
