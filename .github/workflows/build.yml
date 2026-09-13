@@ -47,11 +47,15 @@ jobs:
           mv /tmp/clt/cmdline-tools "$SDK/cmdline-tools/latest"
           yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" --licenses >/dev/null || true
           yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" \
-            "platform-tools" "platforms;android-31" "build-tools;34.0.0"
-          if [ ! -d "$PLATFORM/android-ndk-r25b" ]; then
+            "platform-tools" "platforms;android-31" "build-tools;34.0.0" || true
+          test -d "$SDK/platforms/android-31" || { echo "platform android-31 missing"; exit 1; }
+          test -x "$SDK/platform-tools/adb" || { echo "platform-tools missing"; exit 1; }
+          if [ ! -f "$PLATFORM/android-ndk-r25b/source.properties" ]; then
+            rm -rf "$PLATFORM/android-ndk-r25b"
             curl -sL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r25b-linux.zip
             unzip -q -o /tmp/ndk.zip -d "$PLATFORM"
           fi
+          test -f "$PLATFORM/android-ndk-r25b/source.properties" || { echo "NDK incomplete"; exit 1; }
           ls "$PLATFORM"
 
       - name: Cache Android SDK & NDK (~/.buildozer)
