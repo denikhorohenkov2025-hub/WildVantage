@@ -32,9 +32,9 @@ CACHE_FILE = "wildvantage_v2.json"
 DIRECTIONS = ["С", "СВ", "В", "ЮВ", "Ю", "ЮЗ", "З", "СЗ"]
 
 
-class WildVantagePro(MDApp):
+class WildVantage(MDApp):
     def build(self):
-        self.title = "WildVantage Pro"
+        self.title = "WildVantage"
         self.theme_cls.theme_style = "Dark"
         self.theme_cls.primary_palette = "Green"
         self.theme_cls.primary_hue = "900"
@@ -48,7 +48,7 @@ class WildVantagePro(MDApp):
         layout = MDBoxLayout(orientation="vertical")
 
         self.toolbar = MDTopAppBar(
-            title="WILDVANTAGE PRO",
+            title="WILDVANTAGE",
             anchor_title="center",
             md_bg_color=[0.05, 0.1, 0.05, 1],
             elevation=3,
@@ -203,12 +203,12 @@ class WildVantagePro(MDApp):
             if hasattr(self, "compass_label") and self.compass_label:
                 self.compass_label.text = "КОМПАС: --°"
             if hasattr(self, "direction_label") and self.direction_label:
-                self.direction_label.text = "Датчик недоступен"
+                self.direction_label.text = "Датчик отсутствует"
         else:
             if hasattr(self, "pressure_label") and self.pressure_label:
                 self.pressure_label.text = "ДАВЛЕНИЕ: НЕТ"
             if hasattr(self, "pressure_hint") and self.pressure_hint:
-                self.pressure_hint.text = "Датчик недоступен"
+                self.pressure_hint.text = "Датчик отсутствует"
 
     def update_compass(self, dt):
         if compass is None:
@@ -416,4 +416,4 @@ class WildVantagePro(MDApp):
 
 
 if __name__ == "__main__":
-    WildVantagePro().run()
+    WildVantage().run()

@@ -1,6 +1,6 @@
 [app]
 
-title = WILDVANTAGE PRO
+title = WildVantage
 
 package.name = wildvantage
 
