@@ -20,7 +20,12 @@ from kivymd.uix.textfield import MDTextField
 from kivymd.uix.toolbar import MDTopAppBar
 
 from kivy.clock import Clock
-from plyer import gps, compass, barometer
+from kivy.utils import platform
+
+try:
+    from plyer import gps, compass, barometer
+except Exception:
+    gps = compass = barometer = None
 
 API_KEY = "5dfb720a2f0c5b0c7d131f88236baecf"  # замени на актуальный ключ OpenWeatherMap
 CACHE_FILE = "wildvantage_v2.json"
@@ -156,40 +161,82 @@ class WildVantagePro(MDApp):
         self.load_from_cache()
         return screen
 
-    # --- ДАТЧИКИ ---
-    def start_sensors(self):
-        try:
-            compass.enable()
-            Clock.schedule_interval(self.update_compass, 1 / 10)
-        except Exception:
-            self.compass_label.text = "КОМПАС: --°"
-            self.direction_label.text = "МАГНИТОМЕТР НЕДОСТУПЕН"
+    # --- ДАТЧИКИ — максимально безопасно ---
+    def on_start(self):
+        if platform == "android":
+            try:
+                from android.permissions import request_permissions, Permission
 
-        try:
-            barometer.enable()
-            Clock.schedule_interval(self.update_barometer, 1)
-        except Exception:
-            self.pressure_label.text = "ДАВЛЕНИЕ: НЕТ"
+                request_permissions(
+                    [
+                        Permission.ACCESS_FINE_LOCATION,
+                        Permission.ACCESS_COARSE_LOCATION,
+                        Permission.INTERNET,
+                        Permission.ACCESS_NETWORK_STATE,
+                    ]
+                )
+            except Exception:
+                pass
+
+    def start_sensors(self):
+        if compass is None:
+            self._sensor_unavailable("compass")
+        else:
+            try:
+                compass.enable()
+                Clock.schedule_interval(self.update_compass, 1 / 10)
+            except Exception:
+                self._sensor_unavailable("compass")
+
+        if barometer is None:
+            self._sensor_unavailable("barometer")
+        else:
+            try:
+                barometer.enable()
+                Clock.schedule_interval(self.update_barometer, 1)
+            except Exception:
+                self._sensor_unavailable("barometer")
+
+    def _sensor_unavailable(self, which):
+        which = str(which).lower()
+        if "compass" in which:
+            if hasattr(self, "compass_label") and self.compass_label:
+                self.compass_label.text = "КОМПАС: --°"
+            if hasattr(self, "direction_label") and self.direction_label:
+                self.direction_label.text = "Датчик недоступен"
+        else:
+            if hasattr(self, "pressure_label") and self.pressure_label:
+                self.pressure_label.text = "ДАВЛЕНИЕ: НЕТ"
+            if hasattr(self, "pressure_hint") and self.pressure_hint:
+                self.pressure_hint.text = "Датчик недоступен"
 
     def update_compass(self, dt):
+        if compass is None:
+            return
         try:
             val = compass.field
             if not val:
                 return
             bearing = (math.degrees(math.atan2(val[1], val[0])) + 360) % 360
-            self.compass_label.text = f"КОМПАС: {int(bearing)}°"
+            if self.compass_label:
+                self.compass_label.text = f"КОМПАС: {int(bearing)}°"
             idx = int((bearing + 22.5) // 45) % 8
-            self.direction_label.text = DIRECTIONS[idx]
+            if self.direction_label:
+                self.direction_label.text = DIRECTIONS[idx]
         except Exception:
             pass
 
     def update_barometer(self, dt):
+        if barometer is None:
+            return
         try:
             pressure = barometer.pressure
             if pressure:
-                self.pressure_label.text = f"ДАВЛЕНИЕ: {int(pressure)} гПа"
+                if self.pressure_label:
+                    self.pressure_label.text = f"ДАВЛЕНИЕ: {int(pressure)} гПа"
         except Exception:
-            self.pressure_label.text = "ДАВЛЕНИЕ: НЕТ"
+            if self.pressure_label:
+                self.pressure_label.text = "ДАВЛЕНИЕ: НЕТ"
 
     # --- ПЕРЕКЛЮЧЕНИЕ РЕЖИМА ---
     def toggle_mode(self, instance, value):
@@ -208,6 +255,9 @@ class WildVantagePro(MDApp):
     # --- GPS ---
     def start_gps(self, *args):
         self.status_label.text = "Поиск спутников..."
+        if gps is None:
+            self.status_label.text = "GPS недоступен"
+            return
         try:
             gps.configure(on_location=self.on_location)
             gps.start()
