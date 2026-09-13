@@ -65,24 +65,46 @@ MDBoxLayout:
             size_hint_y: None
             height: self.minimum_height
 
-            # Режим Глуши + поле поиска: вертикально друг под другом
+            # Слой 1 — Поиск города
             MDBoxLayout:
                 orientation: "vertical"
                 adaptive_height: True
-                spacing: dp(20)
+                spacing: dp(15)
                 padding: dp(10)
 
-                MDCard:
+                MDBoxLayout:
                     orientation: "horizontal"
                     adaptive_height: True
-                    padding: dp(14), dp(4)
-                    radius: [dp(12),]
-                    elevation: 0
+                    spacing: dp(8)
+                    padding: dp(12), dp(4)
                     md_bg_color: 0.12, 0.18, 0.12, 1
+                    radius: [dp(14),]
+                    line_color: 0.2, 0.4, 0.2, 1
+                    MDTextField:
+                        id: search_field
+                        hint_text: "Введите город"
+                        size_hint_x: 1
+                        size_hint_y: None
+                        height: dp(48)
+                        mode: "round"
+                    MDIconButton:
+                        icon: "magnify"
+                        on_release: app.search_city()
+                        theme_icon_color: "Custom"
+                        icon_color: 0.6, 0.9, 0.6, 1
+
+                # Слой 2 — Режим Глуши (строго под поиском)
+                MDBoxLayout:
+                    orientation: "horizontal"
+                    adaptive_height: True
+                    spacing: dp(8)
+                    padding: dp(12), dp(4)
+                    md_bg_color: 0.12, 0.18, 0.12, 1
+                    radius: [dp(14),]
                     line_color: 0.2, 0.4, 0.2, 1
                     MDLabel:
                         id: mode_text
-                        text: "Режим: Город (Online)"
+                        text: "РЕЖИМ ГОРОД (ONLINE)"
                         bold: True
                         theme_text_color: "Custom"
                         text_color: 0.85, 1, 0.85, 1
@@ -91,29 +113,6 @@ MDBoxLayout:
                         id: mode_switch
                         active: False
                         on_active: app.toggle_mode(*args)
-
-                MDCard:
-                    orientation: "horizontal"
-                    adaptive_height: True
-                    padding: dp(14), dp(4)
-                    radius: [dp(12),]
-                    elevation: 0
-                    md_bg_color: 0.12, 0.18, 0.12, 1
-                    line_color: 0.2, 0.4, 0.2, 1
-                    MDTextField:
-                        id: search_field
-                        hint_text: "Введите город"
-                        size_hint_x: 1
-                        size_hint_y: None
-                        height: dp(48)
-                        mode: "fill"
-                        fill_color_normal: 0.08, 0.12, 0.08, 1
-                        fill_color_focus: 0.08, 0.12, 0.08, 1
-                    MDIconButton:
-                        icon: "magnify"
-                        on_release: app.search_city()
-                        theme_icon_color: "Custom"
-                        icon_color: 0.6, 0.9, 0.6, 1
 
             # Главная карточка: город, координаты, азимут, температура, солнце
             MDCard:
@@ -149,13 +148,38 @@ MDBoxLayout:
                     bold: True
                     theme_text_color: "Custom"
                     text_color: 0.95, 1, 0.95, 1
-                MDLabel:
-                    id: sun_label
-                    text: "🌅 --:--    🌇 --:--"
-                    halign: "center"
-                    font_size: sp(17)
-                    theme_text_color: "Custom"
-                    text_color: 0.75, 1, 0.75, 1
+                MDBoxLayout:
+                    orientation: "horizontal"
+                    size_hint_y: None
+                    height: dp(32)
+                    Widget:
+                    MDIcon:
+                        icon: "weather-sunset-up"
+                        font_size: sp(22)
+                        theme_text_color: "Custom"
+                        text_color: 0.75, 1, 0.75, 1
+                    MDLabel:
+                        id: sr_label
+                        text: "--:--"
+                        size_hint_x: None
+                        width: dp(48)
+                        halign: "center"
+                        theme_text_color: "Custom"
+                        text_color: 0.85, 1, 0.85, 1
+                    MDIcon:
+                        icon: "weather-sunset-down"
+                        font_size: sp(22)
+                        theme_text_color: "Custom"
+                        text_color: 0.75, 1, 0.75, 1
+                    MDLabel:
+                        id: ss_label
+                        text: "--:--"
+                        size_hint_x: None
+                        width: dp(48)
+                        halign: "center"
+                        theme_text_color: "Custom"
+                        text_color: 0.85, 1, 0.85, 1
+                    Widget:
                 MDLabel:
                     id: status_label
                     text: "Загрузка..."
@@ -163,10 +187,19 @@ MDBoxLayout:
                     font_size: sp(13)
                     theme_text_color: "Custom"
                     text_color: 0.55, 0.75, 0.55, 1
-                MDFillRoundFlatButton:
-                    text: "Обновить GPS"
-                    md_bg_color: 0.2, 0.4, 0.2, 1
-                    on_release: app.start_gps()
+                MDBoxLayout:
+                    orientation: "horizontal"
+                    size_hint_y: None
+                    height: dp(52)
+                    Widget:
+                    MDFillRoundFlatButton:
+                        text: "ОБНОВИТЬ GPS"
+                        size_hint_x: 0.9
+                        size_hint_y: None
+                        height: dp(48)
+                        md_bg_color: 0.2, 0.4, 0.2, 1
+                        on_release: app.start_gps()
+                    Widget:
 
             MDLabel:
                 text: "ПРОГНОЗ НА 5 ДНЕЙ"
@@ -273,12 +306,12 @@ class WildVantage(MDApp):
         try:
             root = self.root.ids
             if value:
-                root.mode_text.text = "Режим: Глушь (Offline)"
+                root.mode_text.text = "РЕЖИМ ГЛУШИ (OFFLINE)"
                 root.mode_text.text_color = 1, 0.4, 0.4, 1
                 root.header.md_bg_color = 0.15, 0.05, 0.05, 1
                 root.search_field.disabled = True
             else:
-                root.mode_text.text = "Режим: Город (Online)"
+                root.mode_text.text = "РЕЖИМ ГОРОД (ONLINE)"
                 root.mode_text.text_color = 0.85, 1, 0.85, 1
                 root.header.md_bg_color = 0.08, 0.12, 0.08, 1
                 root.search_field.disabled = False
@@ -456,7 +489,8 @@ class WildVantage(MDApp):
 
             today = datetime.now().date()
             sunrise, sunset = self.local_sun_times(lat, lon, tz_offset, today)
-            self.root.ids.sun_label.text = f"🌅 {sunrise}    🌇 {sunset}"
+            self.root.ids.sr_label.text = sunrise
+            self.root.ids.ss_label.text = sunset
 
             for f in forecasts:
                 dt = datetime.fromtimestamp(f["dt"])
