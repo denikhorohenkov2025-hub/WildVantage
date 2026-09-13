@@ -22,7 +22,7 @@ from kivymd.uix.toolbar import MDTopAppBar
 from kivy.clock import Clock
 from plyer import gps, compass, barometer
 
-API_KEY = "4f737ca86a1f055b4165360cfa41538d"  # замени на рабочий ключ OpenWeatherMap
+API_KEY = "5dfb720a2f0c5b0c7d131f88236baecf"  # замени на актуальный ключ OpenWeatherMap
 CACHE_FILE = "wildvantage_v2.json"
 DIRECTIONS = ["С", "СВ", "В", "ЮВ", "Ю", "ЮЗ", "З", "СЗ"]
 
