@@ -29,6 +29,8 @@ android.archs = arm64-v8a, armeabi-v7a
 
 android.ndk = 25b
 
+android.python_version = 3.11
+
 android.accept_sdk_license = True
 
 android.enable_androidx = True
