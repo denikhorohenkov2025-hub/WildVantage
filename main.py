@@ -87,6 +87,8 @@ MDBoxLayout:
                         size_hint_y: None
                         height: dp(48)
                         mode: "round"
+                        input_type: "text"
+                        input_filter: None
                     MDIconButton:
                         icon: "magnify"
                         on_release: app.search_city()
@@ -151,11 +153,11 @@ MDBoxLayout:
                 MDBoxLayout:
                     orientation: "horizontal"
                     size_hint_y: None
-                    height: dp(32)
+                    height: dp(36)
                     Widget:
                     MDIcon:
                         icon: "weather-sunset-up"
-                        font_size: sp(22)
+                        font_size: "24sp"
                         theme_text_color: "Custom"
                         text_color: 0.75, 1, 0.75, 1
                     MDLabel:
@@ -166,9 +168,12 @@ MDBoxLayout:
                         halign: "center"
                         theme_text_color: "Custom"
                         text_color: 0.85, 1, 0.85, 1
+                    Widget:
+                        size_hint_x: None
+                        width: dp(14)
                     MDIcon:
                         icon: "weather-sunset-down"
-                        font_size: sp(22)
+                        font_size: "24sp"
                         theme_text_color: "Custom"
                         text_color: 0.75, 1, 0.75, 1
                     MDLabel:
@@ -459,14 +464,29 @@ class WildVantage(MDApp):
 
     # --- ФИЛЬТР: ОДНА ЗАПИСЬ НА 12:00 КАЖДОГО ДНЯ ---
     def _nearest_noon(self, forecast_list):
-        daily = {}
-        for f in forecast_list:
-            dt = datetime.fromtimestamp(f["dt"])
-            key = dt.date()
-            diff = abs(dt.hour - 12)
-            if key not in daily or diff < daily[key][1]:
-                daily[key] = (f, diff)
-        return [v[0] for v in daily.values()]
+        try:
+            by_day = {}
+            for f in forecast_list:
+                if "dt" not in f or "main" not in f:
+                    continue
+                dt = datetime.fromtimestamp(f["dt"])
+                by_day.setdefault(dt.date(), []).append(f)
+            if not by_day:
+                return []
+            selected = []
+            for day in sorted(by_day):
+                entries = by_day[day]
+                exact = [f for f in entries if "12:00:00" in f.get("dt_txt", "")]
+                if exact:
+                    selected.append(exact[0])
+                else:
+                    selected.append(
+                        min(entries, key=lambda f: abs(
+                            datetime.fromtimestamp(f["dt"]).hour - 12))
+                    )
+            return selected
+        except Exception:
+            return []
 
     # --- ОБНОВЛЕНИЕ ИНТЕРФЕЙСА ---
     def refresh_ui(self, data, cache=False):
@@ -480,12 +500,16 @@ class WildVantage(MDApp):
             self.root.ids.loc_label.text = (
                 f"{data['city']['name']}\n{lat:.4f}, {lon:.4f}"
             )
-            forecasts = self._nearest_noon(data["list"])
-            self.root.ids.temp_label.text = f"{int(forecasts[0]['main']['temp'])}°C"
-            self._set_status(
-                f"Обновлено: {data.get('saved_at', 'Неизвестно')}"
-                + ("  (кэш)" if cache else "")
-            )
+            forecasts = self._nearest_noon(data.get("list", []))
+            if forecasts:
+                self.root.ids.temp_label.text = f"{int(forecasts[0]['main']['temp'])}°C"
+                self._set_status(
+                    f"Обновлено: {data.get('saved_at', 'Неизвестно')}"
+                    + ("  (кэш)" if cache else "")
+                )
+            else:
+                self.root.ids.temp_label.text = "--°C"
+                self._set_status("Прогноз временно недоступен (обновите позже)")
 
             today = datetime.now().date()
             sunrise, sunset = self.local_sun_times(lat, lon, tz_offset, today)
