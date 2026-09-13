@@ -1,7 +1,7 @@
 import json
 import math
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import pytz
 from astral import LocationInfo
@@ -20,20 +20,21 @@ from kivymd.uix.textfield import MDTextField
 from kivymd.uix.toolbar import MDTopAppBar
 
 from kivy.clock import Clock
-from plyer import gps, compass
+from plyer import gps, compass, barometer
 
 API_KEY = "4f737ca86a1f055b4165360cfa41538d"  # замени на рабочий ключ OpenWeatherMap
-CACHE_FILE = "wildvantage_cache.json"
+CACHE_FILE = "wildvantage_v2.json"
 DIRECTIONS = ["С", "СВ", "В", "ЮВ", "Ю", "ЮЗ", "З", "СЗ"]
 
 
-class WildVantage(MDApp):
+class WildVantagePro(MDApp):
     def build(self):
-        self.title = "WildVantage"
+        self.title = "WildVantage Pro"
         self.theme_cls.theme_style = "Dark"
         self.theme_cls.primary_palette = "Green"
         self.theme_cls.primary_hue = "900"
 
+        self.api_key = API_KEY
         self.is_wilderness = False
         self.current_lat = None
         self.current_lon = None
@@ -42,7 +43,7 @@ class WildVantage(MDApp):
         layout = MDBoxLayout(orientation="vertical")
 
         self.toolbar = MDTopAppBar(
-            title="WILDVANTAGE",
+            title="WILDVANTAGE PRO",
             anchor_title="center",
             md_bg_color=[0.05, 0.1, 0.05, 1],
             elevation=3,
@@ -51,24 +52,45 @@ class WildVantage(MDApp):
 
         content = MDBoxLayout(orientation="vertical", padding=15, spacing=10)
 
-        # --- КОМПАС ---
+        # --- ДВЕ МИНИ-КАРТОЧКИ: КОМПАС + БАРОМЕТР ---
+        sensors_row = MDBoxLayout(adaptive_height=True, spacing=10)
         self.compass_card = MDCard(
             orientation="vertical",
             padding=10,
-            size_hint=(1, None),
-            height="90dp",
+            size_hint=(0.5, None),
+            height="100dp",
             radius=[15],
             md_bg_color=[0.1, 0.15, 0.1, 1],
         )
         self.compass_label = MDLabel(
-            text="КОМПАС: --°", halign="center", font_style="H5", bold=True
+            text="КОМПАС: --°", halign="center", font_style="H6", bold=True
         )
         self.direction_label = MDLabel(
             text="Направление: --", halign="center", theme_text_color="Secondary"
         )
         self.compass_card.add_widget(self.compass_label)
         self.compass_card.add_widget(self.direction_label)
-        content.add_widget(self.compass_card)
+
+        self.barometer_card = MDCard(
+            orientation="vertical",
+            padding=10,
+            size_hint=(0.5, None),
+            height="100dp",
+            radius=[15],
+            md_bg_color=[0.1, 0.15, 0.1, 1],
+        )
+        self.pressure_label = MDLabel(
+            text="ДАВЛЕНИЕ: НЕТ", halign="center", font_style="H6", bold=True
+        )
+        self.pressure_hint = MDLabel(
+            text="Барометр", halign="center", theme_text_color="Secondary"
+        )
+        self.barometer_card.add_widget(self.pressure_label)
+        self.barometer_card.add_widget(self.pressure_hint)
+
+        sensors_row.add_widget(self.compass_card)
+        sensors_row.add_widget(self.barometer_card)
+        content.add_widget(sensors_row)
 
         # --- РЕЖИМ ---
         mode_box = MDBoxLayout(adaptive_height=True, spacing=10)
@@ -92,12 +114,12 @@ class WildVantage(MDApp):
         search_box.add_widget(self.search_btn)
         content.add_widget(search_box)
 
-        # --- ПОГОДА ---
+        # --- ОСНОВНАЯ КАРТОЧКА ---
         self.info_card = MDCard(
             orientation="vertical",
             padding=15,
             size_hint=(1, None),
-            height="160dp",
+            height="180dp",
             radius=[20],
             md_bg_color=[0.12, 0.18, 0.12, 1],
         )
@@ -134,14 +156,20 @@ class WildVantage(MDApp):
         self.load_from_cache()
         return screen
 
-    # --- КОМПАС (офлайн, магнитометр) ---
+    # --- ДАТЧИКИ ---
     def start_sensors(self):
         try:
             compass.enable()
             Clock.schedule_interval(self.update_compass, 1 / 10)
         except Exception:
-            self.compass_label.text = "НЕТ ДАТЧИКА"
-            self.direction_label.text = "Магнитометр недоступен на этом устройстве"
+            self.compass_label.text = "КОМПАС: --°"
+            self.direction_label.text = "МАГНИТОМЕТР НЕДОСТУПЕН"
+
+        try:
+            barometer.enable()
+            Clock.schedule_interval(self.update_barometer, 1)
+        except Exception:
+            self.pressure_label.text = "ДАВЛЕНИЕ: НЕТ"
 
     def update_compass(self, dt):
         try:
@@ -154,6 +182,14 @@ class WildVantage(MDApp):
             self.direction_label.text = DIRECTIONS[idx]
         except Exception:
             pass
+
+    def update_barometer(self, dt):
+        try:
+            pressure = barometer.pressure
+            if pressure:
+                self.pressure_label.text = f"ДАВЛЕНИЕ: {int(pressure)} гПа"
+        except Exception:
+            self.pressure_label.text = "ДАВЛЕНИЕ: НЕТ"
 
     # --- ПЕРЕКЛЮЧЕНИЕ РЕЖИМА ---
     def toggle_mode(self, instance, value):
@@ -199,11 +235,12 @@ class WildVantage(MDApp):
         try:
             geo_url = (
                 f"https://api.openweathermap.org/geo/1.0/direct"
-                f"?q={city}&limit=1&appid={API_KEY}"
+                f"?q={city}&limit=1&appid={self.api_key}"
             )
             r = requests.get(geo_url, timeout=5)
             if r.status_code == 401:
-                self.status_label.text = "Ошибка API: неверный ключ (401)"
+                self.status_label.text = "Ошибка ключа (401) — данные из кэша"
+                self.load_from_cache()
                 return
             if r.status_code == 200 and r.json():
                 loc = r.json()[0]
@@ -213,7 +250,7 @@ class WildVantage(MDApp):
             else:
                 self.status_label.text = "Город не найден"
         except Exception:
-            self.status_label.text = "Нет сети — работаю из кэша"
+            self.status_label.text = "Нет сети — данные из кэша"
             self.load_from_cache()
 
     # --- ПОГОДА (онлайн) ---
@@ -221,11 +258,12 @@ class WildVantage(MDApp):
         try:
             url = (
                 f"https://api.openweathermap.org/data/2.5/forecast"
-                f"?lat={lat}&lon={lon}&appid={API_KEY}&units=metric&lang=ru"
+                f"?lat={lat}&lon={lon}&appid={self.api_key}&units=metric&lang=ru"
             )
             r = requests.get(url, timeout=5)
             if r.status_code == 401:
-                self.status_label.text = "Ошибка API: неверный ключ (401)"
+                self.status_label.text = "Ошибка ключа (401) — данные из кэша"
+                self.load_from_cache()
                 return
             if r.status_code == 200:
                 data = r.json()
@@ -234,10 +272,10 @@ class WildVantage(MDApp):
                     json.dump(data, f)
                 self.refresh_ui(data)
             else:
-                self.status_label.text = "API ошибка — работаю из кэша"
+                self.status_label.text = "API ошибка — данные из кэша"
                 self.load_from_cache()
         except Exception:
-            self.status_label.text = "Нет сети — работаю из кэша"
+            self.status_label.text = "Нет сети — данные из кэша"
             self.load_from_cache()
 
     # --- УМНЫЙ КЭШ ---
@@ -245,15 +283,14 @@ class WildVantage(MDApp):
         try:
             with open(CACHE_FILE, "r") as f:
                 data = json.load(f)
-            recalc_sun_for_current_pos = False
             if new_lat and new_lon:
                 data["city"]["coord"] = {"lat": new_lat, "lon": new_lon}
-                data["city"]["name"] = f"Точка GPS: {new_lat:.2f}, {new_lon:.2f}"
-                data["city"]["timezone"] = self.estimate_timezone(new_lon)
-                recalc_sun_for_current_pos = True
-            self.refresh_ui(data, cache=True, recalc_sun=recalc_sun_for_current_pos)
+                data["city"]["name"] = "Точка GPS"
+                if "timezone" not in data["city"]:
+                    data["city"]["timezone"] = self.estimate_timezone(new_lon)
+            self.refresh_ui(data, cache=True)
         except Exception:
-            self.status_label.text = "Нет кэша — данные недоступны"
+            self.status_label.text = "Нет данных (кэш пуст)"
 
     def estimate_timezone(self, lon):
         try:
@@ -272,16 +309,42 @@ class WildVantage(MDApp):
         except Exception:
             return "--:--", "--:--"
 
+    # --- ДИНАМИЧЕСКАЯ ИКОНКА ПОГОДЫ ---
+    def weather_icon(self, description):
+        d = description.lower()
+        if any(w in d for w in ("гроза", "storm", "lightning")):
+            return "weather-lightning"
+        if any(w in d for w in ("снег", "snow")):
+            return "weather-snowy"
+        if any(w in d for w in ("дождь", "ливень", "rain", "drizzle")):
+            return "weather-rainy"
+        if any(w in d for w in ("туман", "дымка", "fog", "mist", "пыль", "haze")):
+            return "weather-fog"
+        if any(w in d for w in ("облач", "cloud")):
+            return "weather-cloudy"
+        return "weather-sunny"
+
+    # --- ФИЛЬТР: ОДНА ЗАПИСЬ НА 12:00 КАЖДОГО ДНЯ ---
+    def _nearest_noon(self, forecast_list):
+        daily = {}
+        for f in forecast_list:
+            dt = datetime.fromtimestamp(f["dt"])
+            key = dt.date()
+            diff = abs(dt.hour - 12)
+            if key not in daily or diff < daily[key][1]:
+                daily[key] = (f, diff)
+        return [v[0] for v in daily.values()]
+
     # --- ОБНОВЛЕНИЕ ИНТЕРФЕЙСА ---
-    def refresh_ui(self, data, cache=False, recalc_sun=False):
+    def refresh_ui(self, data, cache=False):
         self.data_list.clear_widgets()
 
         lat = data["city"]["coord"]["lat"]
         lon = data["city"]["coord"]["lon"]
         tz_offset = data["city"].get("timezone", self.estimate_timezone(lon))
 
-        self.loc_label.text = data["city"]["name"]
-        forecasts = data["list"][::8]
+        self.loc_label.text = f"{data['city']['name']}\n{lat:.4f}, {lon:.4f}"
+        forecasts = self._nearest_noon(data["list"])
         self.temp_label.text = f"{int(forecasts[0]['main']['temp'])}°C"
         self.status_label.text = (
             f"Обновлено: {data.get('saved_at', 'Неизвестно')}"
@@ -291,19 +354,16 @@ class WildVantage(MDApp):
         for f in forecasts:
             dt = datetime.fromtimestamp(f["dt"])
             sunrise, sunset = self.local_sun_times(lat, lon, tz_offset, dt.date())
+            description = f["weather"][0]["description"]
 
             item = ThreeLineIconListItem(
                 text=f"{dt.strftime('%d.%m')} | {int(f['main']['temp'])}°C",
-                secondary_text=f"{f['weather'][0]['description'].capitalize()}",
+                secondary_text=description.capitalize(),
                 tertiary_text=f"🌅 Восход: {sunrise} | 🌇 Закат: {sunset}",
             )
-            item.add_widget(
-                IconLeftWidget(
-                    icon="compass-rose" if self.is_wilderness else "weather-sunny"
-                )
-            )
+            item.add_widget(IconLeftWidget(icon=self.weather_icon(description)))
             self.data_list.add_widget(item)
 
 
 if __name__ == "__main__":
-    WildVantage().run()
+    WildVantagePro().run()
