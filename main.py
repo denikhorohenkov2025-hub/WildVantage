@@ -22,10 +22,7 @@ from kivymd.uix.toolbar import MDTopAppBar
 from kivy.clock import Clock
 from kivy.utils import platform
 
-try:
-    from plyer import gps, compass, barometer
-except Exception:
-    gps = compass = barometer = None
+gps = compass = barometer = None
 
 API_KEY = "5dfb720a2f0c5b0c7d131f88236baecf"  # замени на актуальный ключ OpenWeatherMap
 CACHE_FILE = "wildvantage_v2.json"
@@ -157,26 +154,50 @@ class WildVantage(MDApp):
         layout.add_widget(content)
         screen.add_widget(layout)
 
-        self.start_sensors()
-        self.load_from_cache()
+        # Safe Boot: минимальный каркас уже нарисован, всё остальное — через 3 сек
+        self.status_label.text = "Загрузка..."
+        Clock.schedule_once(self.safe_start, 3)
         return screen
 
-    # --- ДАТЧИКИ — максимально безопасно ---
-    def on_start(self):
-        if platform == "android":
-            try:
-                from android.permissions import request_permissions, Permission
+    # --- ВТОРАЯ ФАЗА ЗАГРУЗКИ: датчики + разрешения (не перегружает UI-поток) ---
+    def safe_start(self, dt):
+        self.status_label.text = "Проверка датчиков и разрешений..."
+        self._import_sensors()
+        self._request_permissions()
+        self.start_sensors()
+        self.load_from_cache()
 
-                request_permissions(
-                    [
-                        Permission.ACCESS_FINE_LOCATION,
-                        Permission.ACCESS_COARSE_LOCATION,
-                        Permission.INTERNET,
-                        Permission.ACCESS_NETWORK_STATE,
-                    ]
-                )
-            except Exception:
-                pass
+    def _import_sensors(self):
+        global gps, compass, barometer
+        try:
+            from plyer import compass
+        except Exception:
+            compass = None
+        try:
+            from plyer import barometer
+        except Exception:
+            barometer = None
+        try:
+            from plyer import gps
+        except Exception:
+            gps = None
+
+    def _request_permissions(self):
+        if platform != "android":
+            return
+        try:
+            from android.permissions import request_permissions, Permission
+
+            request_permissions(
+                [
+                    Permission.ACCESS_FINE_LOCATION,
+                    Permission.ACCESS_COARSE_LOCATION,
+                    Permission.INTERNET,
+                    Permission.ACCESS_NETWORK_STATE,
+                ]
+            )
+        except Exception:
+            pass
 
     def start_sensors(self):
         if compass is None:
@@ -203,12 +224,12 @@ class WildVantage(MDApp):
             if hasattr(self, "compass_label") and self.compass_label:
                 self.compass_label.text = "КОМПАС: --°"
             if hasattr(self, "direction_label") and self.direction_label:
-                self.direction_label.text = "Датчик отсутствует"
+                self.direction_label.text = "Датчик недоступен"
         else:
             if hasattr(self, "pressure_label") and self.pressure_label:
                 self.pressure_label.text = "ДАВЛЕНИЕ: НЕТ"
             if hasattr(self, "pressure_hint") and self.pressure_hint:
-                self.pressure_hint.text = "Датчик отсутствует"
+                self.pressure_hint.text = "Датчик недоступен"
 
     def update_compass(self, dt):
         if compass is None:
