@@ -27,6 +27,13 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install buildozer Cython
 
+      - name: Cache p4a build dir
+        uses: actions/cache@v4
+        with:
+          path: .buildozer
+          key: buildozer-${{ hashFiles('buildozer.spec') }}
+          restore-keys: buildozer-
+
       - name: Build APK (первый раз идёт ~30 мин)
         run: |
           python -m buildozer android debug

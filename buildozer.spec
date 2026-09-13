@@ -35,8 +35,6 @@ android.accept_sdk_license = True
 
 android.enable_androidx = True
 
-android.features = android.hardware.sensor.compass, android.hardware.location.gps
-
 android.logcat_filters =
     *:S
     Python:V
