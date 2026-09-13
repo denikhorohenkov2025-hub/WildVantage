@@ -4,13 +4,16 @@ from datetime import datetime
 
 from kivy.clock import Clock
 from kivy.lang import Builder
+from kivy.metrics import dp, sp
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.widget import Widget
 from kivy.utils import platform
 from kivymd.app import MDApp
 from kivymd.uix.boxlayout import MDBoxLayout
 from kivymd.uix.button import MDIconButton, MDFillRoundFlatButton
 from kivymd.uix.card import MDCard
-from kivymd.uix.label import MDLabel
-from kivymd.uix.list import MDList, ThreeLineIconListItem, IconLeftWidget
+from kivymd.uix.label import MDLabel, MDIcon
+from kivymd.uix.list import MDList
 from kivymd.uix.scrollview import MDScrollView
 from kivymd.uix.selectioncontrol import MDSwitch
 from kivymd.uix.textfield import MDTextField
@@ -89,6 +92,8 @@ MDBoxLayout:
                         mode: "round"
                         input_type: "text"
                         input_filter: None
+                        keyboard_suggestions: True
+                        helper_text_mode: "on_error"
                     MDIconButton:
                         icon: "magnify"
                         on_release: app.search_city()
@@ -121,7 +126,7 @@ MDBoxLayout:
                 id: info_card
                 orientation: "vertical"
                 size_hint_y: None
-                height: dp(310)
+                height: dp(355)
                 padding: dp(16)
                 spacing: dp(6)
                 radius: [dp(18),]
@@ -133,20 +138,22 @@ MDBoxLayout:
                     text: "Ожидание данных..."
                     halign: "center"
                     font_style: "H6"
+                    font_size: sp(25)
+                    bold: True
                     theme_text_color: "Custom"
                     text_color: 0.9, 1, 0.9, 1
                 MDLabel:
                     id: azimuth_label
                     text: "Азимут: --"
                     halign: "center"
-                    font_size: sp(16)
+                    font_size: sp(17)
                     theme_text_color: "Custom"
                     text_color: 0.6, 0.8, 0.6, 1
                 MDLabel:
                     id: temp_label
                     text: "--°C"
                     halign: "center"
-                    font_style: "H2"
+                    font_size: sp(56)
                     bold: True
                     theme_text_color: "Custom"
                     text_color: 0.95, 1, 0.95, 1
@@ -336,16 +343,36 @@ class WildVantage(MDApp):
             self._set_status("Ошибка GPS: включите спутники")
 
     def on_location(self, **kwargs):
-        self.current_lat = kwargs.get("lat")
-        self.current_lon = kwargs.get("lon")
+        lat = kwargs.get("lat")
+        lon = kwargs.get("lon")
+        self.current_lat = lat
+        self.current_lon = lon
         try:
             gps.stop()
         except Exception:
             pass
+        if not lat or not lon:
+            self._set_status("GPS: координаты не получены")
+            return
+        self._show_offline_point(lat, lon)
         if self.is_wilderness:
-            self.load_from_cache(new_lat=self.current_lat, new_lon=self.current_lon)
-        else:
-            self.fetch_weather_by_coords(self.current_lat, self.current_lon)
+            return
+        self.fetch_weather_by_coords(lat, lon, gps_mode=True)
+
+    # Точка GPS: сразу координаты + солнце (офлайн, без ожидания API)
+    def _show_offline_point(self, lat, lon):
+        try:
+            tz_offset = self.estimate_timezone(lon)
+            today = datetime.now().date()
+            sr, ss = self.local_sun_times(lat, lon, tz_offset, today)
+            self.root.ids.loc_label.text = f"Точка GPS\n{lat:.4f}, {lon:.4f}"
+            self.root.ids.temp_label.text = "--°C"
+            self.root.ids.sr_label.text = sr
+            self.root.ids.ss_label.text = ss
+            self.root.ids.data_list.clear_widgets()
+            self._set_status("Спутники: ОК | Погода: запрос...")
+        except Exception:
+            self._set_status("GPS: ошибка отображения точки")
 
     # --- ПОИСК ГОРОДА (онлайн, с кириллицей) ---
     def search_city(self, *args):
@@ -384,10 +411,13 @@ class WildVantage(MDApp):
             self.load_from_cache()
 
     # --- ПОГОДА (онлайн) ---
-    def fetch_weather_by_coords(self, lat, lon):
+    def fetch_weather_by_coords(self, lat, lon, gps_mode=False):
         if requests is None:
-            self._set_status("Нет сети — данные из кэша")
-            self.load_from_cache()
+            if gps_mode:
+                self._set_status("Спутники: ОК | Погода: Нет сети")
+            else:
+                self._set_status("Нет сети — данные из кэша")
+                self.load_from_cache()
             return
         try:
             url = (
@@ -396,8 +426,11 @@ class WildVantage(MDApp):
             )
             r = requests.get(url, timeout=5)
             if r.status_code == 401:
-                self._set_status("Ошибка ключа (401) — данные из кэша")
-                self.load_from_cache()
+                if gps_mode:
+                    self._set_status("Спутники: ОК | Погода: Ожидание API (401)")
+                else:
+                    self._set_status("Ошибка ключа (401) — данные из кэша")
+                    self.load_from_cache()
                 return
             if r.status_code == 200:
                 data = r.json()
@@ -406,11 +439,19 @@ class WildVantage(MDApp):
                     json.dump(data, f)
                 self.refresh_ui(data)
             else:
-                self._set_status("API ошибка — данные из кэша")
-                self.load_from_cache()
+                if gps_mode:
+                    self._set_status(
+                        f"Спутники: ОК | Погода: API ошибка ({r.status_code})"
+                    )
+                else:
+                    self._set_status("API ошибка — данные из кэша")
+                    self.load_from_cache()
         except Exception:
-            self._set_status("Нет сети — данные из кэша")
-            self.load_from_cache()
+            if gps_mode:
+                self._set_status("Спутники: ОК | Погода: Нет сети")
+            else:
+                self._set_status("Нет сети — данные из кэша")
+                self.load_from_cache()
 
     # --- УМНЫЙ КЭШ ---
     def load_from_cache(self, new_lat=None, new_lon=None):
@@ -516,21 +557,89 @@ class WildVantage(MDApp):
             self.root.ids.sr_label.text = sunrise
             self.root.ids.ss_label.text = sunset
 
+            if not forecasts:
+                return
             for f in forecasts:
-                dt = datetime.fromtimestamp(f["dt"])
-                sr, ss = self.local_sun_times(lat, lon, tz_offset, dt.date())
-                description = f["weather"][0]["description"]
-
-                item = ThreeLineIconListItem(
-                    text=f"{dt.strftime('%d.%m')} | {int(f['main']['temp'])}°C",
-                    secondary_text=description.capitalize(),
-                    tertiary_text=f"Восход: {sr}  |  Закат: {ss}",
-                )
-                item.add_widget(IconLeftWidget(icon=self.weather_icon(description)))
-                self.root.ids.data_list.add_widget(item)
+                self._add_forecast_row(f, lat, lon, tz_offset)
         except Exception:
             self._set_status("Ошибка отображения данных")
             self.load_from_cache()
+
+    # --- СТРОКА ПРОГНОЗА: дата/температура + иконки солнца ---
+    def _add_forecast_row(self, f, lat, lon, tz_offset):
+        try:
+            dt = datetime.fromtimestamp(f["dt"])
+            sr, ss = self.local_sun_times(lat, lon, tz_offset, dt.date())
+            description = f["weather"][0]["description"]
+            temp = f["main"]["temp"]
+
+            row = MDCard(
+                orientation="horizontal",
+                size_hint_y=None,
+                height=dp(84),
+                padding=[dp(12), dp(8)],
+                spacing=dp(8),
+                radius=[dp(14),],
+                elevation=0,
+                md_bg_color=(0.11, 0.16, 0.11, 1),
+                line_color=(0.2, 0.4, 0.2, 1),
+            )
+            row.add_widget(MDIcon(
+                icon=self.weather_icon(description),
+                font_size="28sp",
+                theme_text_color="Custom",
+                text_color=(0.75, 1, 0.75, 1),
+            ))
+
+            col = BoxLayout(orientation="vertical", spacing=dp(2))
+            col.add_widget(MDLabel(
+                text=f"{dt.strftime('%d.%m')} | {int(temp)}°C  ·  {description.capitalize()}",
+                font_size=sp(17),
+                bold=True,
+                theme_text_color="Custom",
+                text_color=(0.9, 1, 0.9, 1),
+                halign="left",
+            ))
+            sun_box = BoxLayout(
+                orientation="horizontal",
+                size_hint_y=None,
+                height=dp(28),
+                spacing=dp(6),
+            )
+            sun_box.add_widget(MDIcon(
+                icon="weather-sunset-up",
+                font_size="22sp",
+                theme_text_color="Custom",
+                text_color=(0.7, 0.95, 0.7, 1),
+            ))
+            sun_box.add_widget(MDLabel(
+                text=sr,
+                size_hint_x=None,
+                width=dp(54),
+                font_size=sp(15),
+                theme_text_color="Custom",
+                text_color=(0.85, 1, 0.85, 1),
+            ))
+            sun_box.add_widget(Widget(size_hint_x=None, width=dp(10)))
+            sun_box.add_widget(MDIcon(
+                icon="weather-sunset-down",
+                font_size="22sp",
+                theme_text_color="Custom",
+                text_color=(0.7, 0.95, 0.7, 1),
+            ))
+            sun_box.add_widget(MDLabel(
+                text=ss,
+                size_hint_x=None,
+                width=dp(54),
+                font_size=sp(15),
+                theme_text_color="Custom",
+                text_color=(0.85, 1, 0.85, 1),
+            ))
+            col.add_widget(sun_box)
+            row.add_widget(col)
+            self.root.ids.data_list.add_widget(row)
+        except Exception:
+            pass
 
     def on_start(self):
         Clock.schedule_once(self.delayed_init, 2)
