@@ -318,30 +318,43 @@ class WildVantage(MDApp):
 
     # --- ОТОБРАЖЕНИЕ ДАННЫХ ---
     def process_data(self, data, from_cache=False):
-        # ФИКС: всегда ЧИСТОЕ название города (не район метеостанции)
         city_name = data.get("city", {}).get("name", "Неизвестно")
         self.root.ids.loc_label.text = city_name
 
-        lat = data["city"]["coord"]["lat"]
-        lon = data["city"]["coord"]["lon"]
-        self.root.ids.coords_label.text = f"{lat:.4f}, {lon:.4f}"
+        try:
+            lat = data["city"]["coord"]["lat"]
+            lon = data["city"]["coord"]["lon"]
+            self.root.ids.coords_label.text = f"{lat:.4f}, {lon:.4f}"
+        except Exception:
+            lat = lon = None
+
+        forecast_list = data.get("list")
+        if not isinstance(forecast_list, list) or not forecast_list:
+            self.root.ids.main_temp.text = "--°C"
+            self._set_status("Прогноз временно недоступен (обновите позже)")
+            return
 
         # Группировка по дням
         days = {}
-        for x in data["list"]:
+        for x in forecast_list:
+            if "dt" not in x or "main" not in x:
+                continue
             d = datetime.fromtimestamp(x["dt"]).date()
             days.setdefault(d, []).append(x)
 
         day_list = list(days.keys())[:5]  # СТРОГО 5 ДНЕЙ
         self.root.ids.forecast_list.clear_widgets()
 
-        tz_east = data["city"].get("timezone", self.estimate_timezone(lon))
+        tz_east = data["city"].get("timezone", self.estimate_timezone(lon) if lon is not None else 0)
 
         for i, d_str in enumerate(day_list):
             temps = days[d_str]
             max_t = int(max(t["main"].get("temp_max", t["main"].get("temp")) for t in temps))
             min_t = int(min(t["main"].get("temp_min", t["main"].get("temp")) for t in temps))
-            desc = temps[len(temps) // 2]["weather"][0]["description"]
+            desc = (
+                temps[len(temps) // 2].get("weather", [{}])[0]
+                .get("description", "")
+            )
 
             if i == 0:  # сегодняшний диапазон на главный экран
                 self.root.ids.main_temp.text = f"{max_t}° / {min_t}°"
@@ -375,6 +388,8 @@ class WildVantage(MDApp):
 
         def wrap(cb):
             def wrapped(*a):
+                if state["done"]:
+                    return
                 state["done"] = True
                 cb(*a)
 
@@ -437,7 +452,7 @@ class WildVantage(MDApp):
     def on_gps_loc(self, **kwargs):
         lat = kwargs.get("lat")
         lon = kwargs.get("lon")
-        if not lat or not lon:
+        if lat is None or lon is None:
             self._set_status("GPS: координаты не получены")
             return
         try:
@@ -497,7 +512,9 @@ class WildVantage(MDApp):
                 if city_filter.lower() not in cached.lower():
                     self._set_status("Город не найден в кэше")
                     return
-            if lat:
+            if lat is not None and lon is not None:
+                if "city" not in data or not isinstance(data["city"], dict):
+                    data["city"] = {}
                 data["city"]["coord"] = {"lat": lat, "lon": lon}
             self.process_data(data, from_cache=True)
             if show_err:
@@ -515,11 +532,7 @@ class WildVantage(MDApp):
             result["saved_at"] = datetime.now().strftime("%d.%m %H:%M")
             with open(self.cache_file, "w") as f:
                 json.dump(result, f)
-            if self.is_wilderness:
-                # онлайн в глуши — обновляем и сохраняем в кэш
-                self.process_data(result)
-            else:
-                self.process_data(result)
+            self.process_data(result)
         except Exception:
             self.load_cache(show_err=True)
 
