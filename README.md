@@ -28,7 +28,7 @@
 **Как установить:**
 
 1. Открой [раздел Releases](https://github.com/denikhorohenkov2025-hub/WildVantage/releases/latest).
-2. Скачай `WILDVANTAGE-v12.5.apk`.
+2. Скачай `WILDVANTAGE-v12.6.apk`.
 3. Открой APK — разреши установку из неизвестных источников.
 4. При первом запуске разреши доступ к местоположению.
 
