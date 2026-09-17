@@ -1,4 +1,6 @@
 import json
+import os
+import time
 import urllib.parse
 from datetime import datetime
 
@@ -19,9 +21,15 @@ try:
 except Exception:
     certifi = None
 
-CACHE_FILE = "wildvantage_v3.json"
+CACHE_FILE = "wildvantage_v4.json"
 NOMINATIM_UA = "WildVantage (Android weather app; contact: denikhorohenkov2025-hub)"
-GPS_TIMEOUT = 25
+
+# Сбор GPS: ищем лучший fix, не берём первый грубый.
+GPS_SEARCH_TIMEOUT = 28   # максимум ожидания хорошего fix, сек
+GPS_GOOD_ACCURACY = 10.0  # при <=10 м завершаем сразу
+GPS_OK_ACCURACY = 20.0    # при <=20 м можно принять, если нет улучшения
+GPS_SETTLE_TIME = 6.0     # сколько ждать улучшения при <=20 м, сек
+GPS_STALE_AGE = 8.0       # fix старше этого возраста отбрасываем, сек
 
 # Погода: Open-Meteo (бесплатно, без ключа).
 # current: temperature_2m, weather_code, cloud_cover, is_day
@@ -110,41 +118,66 @@ def _clean_part(s):
 
 def pick_location_name(address):
     """Выбирает наиболее конкретное человеческое название из адреса Nominatim."""
+    details = location_pick_details(address)
+    return details["name"] if details else None
+
+
+def _first_set(address, keys):
+    """Первый непустой key из списка и его очищенное значение."""
+    for k in keys:
+        v = address.get(k)
+        if isinstance(v, str):
+            c = _clean_part(v)
+            if c:
+                return k, c
+    return None, None
+
+
+# Порядок приоритета для «района» (самое конкретное наверху).
+DISTRICT_FIELDS = [
+    "neighbourhood",   # соседство, микрорайон (OsmAnd/qName, напр. «Новокосино»)
+    "suburb",          # район/квартал города
+    "city_district",   # административный округ
+    "quarter",         # квартал
+    "borough",         # боро
+    "district",        # район
+    "city_block",      # квартал/блок
+    "residential",     # самоназвание жилого комплекса (не район!)
+]
+LOCALITY_FIELDS = ["city", "town", "village", "municipality", "hamlet", "locality"]
+FALLBACK_FIELDS = ["county", "state", "region"]
+
+
+def location_pick_details(address):
+    """Разбор адреса Nominatim: какое поле выбрано для района и города.
+
+    Возвращает dict с ключами:
+      district_field / district  — выбранное поле района и значение,
+      locality_field / locality  — выбранный город/населённый пункт,
+      name                       — итоговое имя для интерфейса (или None).
+    """
     if not isinstance(address, dict):
         return None
 
-    def first(keys):
-        for k in keys:
-            v = address.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-        return None
-
-    district = _clean_part(
-        first(
-            [
-                "neighbourhood",
-                "suburb",
-                "city_district",
-                "quarter",
-                "borough",
-                "district",
-                "city_block",
-                "residential",
-            ]
-        )
-    )
-    locality = _clean_part(
-        first(["city", "town", "village", "municipality", "hamlet", "locality"])
-    )
+    dist_key, district = _first_set(address, DISTRICT_FIELDS)
+    loc_key, locality = _first_set(address, LOCALITY_FIELDS)
 
     if district and locality and district.lower() != locality.lower():
-        return f"{locality}, {district}"
+        return {
+            "district_field": dist_key,
+            "district": district,
+            "locality_field": loc_key,
+            "locality": locality,
+            "name": f"{locality}, {district}",
+        }
     if district:
-        return district
+        return {"district_field": dist_key, "district": district, "name": district}
     if locality:
-        return locality
-    return _clean_part(first(["county", "state", "region"]))
+        return {"locality_field": loc_key, "locality": locality, "name": locality}
+    f_key, f_val = _first_set(address, FALLBACK_FIELDS)
+    if f_val:
+        return {f_key: f_val, "name": f_val}
+    return {"name": None}
 
 
 def _at(seq, i):
@@ -198,6 +231,11 @@ def fmt_hhmm(iso):
     if isinstance(iso, str) and len(iso) >= 16 and "T" in iso:
         return iso[11:16]
     return "--:--"
+
+
+def updated_status_text(iso):
+    """Компактная строка статуса. Timezone в UI НЕ показываем."""
+    return f"Обновлено: {fmt_hhmm(iso)}"
 
 
 def fmt_ddmm(iso):
@@ -368,9 +406,10 @@ MDScreen:
                         MDLabel:
                             id: sunrise_label
                             text: "--:--"
+                            font_size: "16sp"
                             size_hint: None, None
                             width: self.texture_size[0]
-                            height: self.texture_size[1]
+                            height: "24dp"
                             text_size: None, None
                             halign: 'center'
                             theme_text_color: "Custom"
@@ -391,9 +430,10 @@ MDScreen:
                         MDLabel:
                             id: sunset_label
                             text: "--:--"
+                            font_size: "16sp"
                             size_hint: None, None
                             width: self.texture_size[0]
-                            height: self.texture_size[1]
+                            height: "24dp"
                             text_size: None, None
                             halign: 'center'
                             theme_text_color: "Custom"
@@ -459,7 +499,7 @@ class WildVantage(MDApp):
         self._last_weather = None
         self._last_coords = None
         self._loc_name = ""
-        self._gps_watchdog = None
+        self._reset_gps_state()
         return Builder.load_string(KV)
 
     def on_start(self):
@@ -482,6 +522,15 @@ class WildVantage(MDApp):
             pass
 
     def _safe_start(self, *args):
+        # Миграция кэша: старые файлы с прежним названием («Косино» и им подобным)
+        # удаляем, чтобы название не переживало эту версию.
+        for old in ("wildvantage_v2.json", "wildvantage_v3.json"):
+            try:
+                if os.path.exists(old):
+                    os.remove(old)
+                    self.log("cache: удалён старый файл", old)
+            except Exception:
+                pass
         self.load_cache()
 
     def log(self, *args):
@@ -608,12 +657,52 @@ class WildVantage(MDApp):
     def on_geocode_error(self, *args):
         self._set_status("Город не найден (нет сети)")
 
-    # --- GPS ---
+    # --- GPS: сбор нескольких fixes, выбор лучшего по accuracy ---
+    def _reset_gps_state(self):
+        # Полное прекращение предыдущего сеанса: стоп провайдера, отмена таймеров,
+        # сброс накопленных fix. Повторное нажатие не должно давать двух слушателей.
+        self._stop_gps()
+        self._cancel_gps_timers()
+        self._gps_fixes = []
+        self._gps_best = None
+        self._gps_last_ts = 0.0
+        self._gps_active = False
+
+    def _cancel_gps_timers(self):
+        for attr in ("_gps_deadline", "_gps_settle"):
+            timer = getattr(self, attr, None)
+            if timer is not None:
+                try:
+                    timer.cancel()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+    def _has_fine_location(self):
+        """Проверка runtime-разрешения точного местоположения (Android)."""
+        if platform != "android":
+            return True
+        try:
+            from android.permissions import check_permission, Permission
+
+            return bool(check_permission(Permission.ACCESS_FINE_LOCATION))
+        except Exception:
+            return True
+
     def run_gps_logic(self):
-        self._set_status("Поиск спутников...")
+        self._set_status("Поиск спутников…")
         if gps is None:
             self._set_status("GPS недоступен")
             return
+        if not self._has_fine_location():
+            self._request_permissions()
+            self._set_status("Нужно разрешение на точное местоположение")
+            return
+        # Инвалидируем влетающие запросы предыдущего обновления (гонка):
+        # их колбэки с gen != self._gen  будут отброшены.
+        self._gen += 1
+        self.log("gps: новый сеанс, gen =", self._gen)
+        self._reset_gps_state()
         try:
             gps.configure(on_location=self.on_gps_loc, on_status=self.on_gps_status)
         except Exception:
@@ -623,28 +712,16 @@ class WildVantage(MDApp):
                 self._set_status("Ошибка GPS: включите спутники")
                 return
         try:
-            gps.start(minTime=1000, minDistance=0)
+            # частые обновления: было 1000 мс, теперь 500 мс
+            gps.start(minTime=500, minDistance=0)
         except Exception:
             self._set_status("Ошибка GPS: включите спутники")
             return
-        self._arm_gps_watchdog()
-
-    def _arm_gps_watchdog(self):
-        self._cancel_gps_watchdog()
-        self._gps_watchdog = Clock.schedule_once(self._gps_timeout, GPS_TIMEOUT)
-
-    def _cancel_gps_watchdog(self):
-        if self._gps_watchdog is not None:
-            try:
-                self._gps_watchdog.cancel()
-            except Exception:
-                pass
-            self._gps_watchdog = None
-
-    def _gps_timeout(self, *args):
-        self._gps_watchdog = None
-        self._stop_gps()
-        self._set_status("GPS: нет сигнала. Проверьте небо и разрешение.")
+        self._gps_active = True
+        self._gps_deadline = Clock.schedule_once(
+            lambda dt: self._finish_gps("таймаут поиска"), GPS_SEARCH_TIMEOUT
+        )
+        self.log("gps: старт сбора fixes, лимит", GPS_SEARCH_TIMEOUT, "с")
 
     def _stop_gps(self):
         try:
@@ -652,27 +729,114 @@ class WildVantage(MDApp):
         except Exception:
             pass
 
-    def on_gps_status(self, **kwargs):
-        self.log("gps status:", kwargs)
+    def _arm_settle(self):
+        """Ждём улучшения при уже приемлемой точности (<=20 м)."""
+        if getattr(self, "_gps_settle", None) is not None:
+            try:
+                self._gps_settle.cancel()
+            except Exception:
+                pass
+            self._gps_settle = None
+        if self._gps_best and self._gps_best["accuracy"] <= GPS_OK_ACCURACY:
+            self._gps_settle = Clock.schedule_once(
+                lambda dt: self._finish_gps("нет улучшения при ≤20 м"), GPS_SETTLE_TIME
+            )
+
+    def on_gps_status(self, *args):
+        # plyer вызывает on_status('provider-disabled'|'provider-status', value)
+        # ПОЗИЦИОННО, поэтому принимаем *args, а не **kwargs.
+        self.log("gps status:", args)
+        if args and args[0] == "provider-disabled" and getattr(self, "_gps_active", False):
+            self._set_status("GPS выключен — включите спутники")
 
     def on_gps_loc(self, **kwargs):
-        lat = kwargs.get("lat")
-        lon = kwargs.get("lon")
-        if lat is None or lon is None:
-            self._set_status("GPS: координаты не получены")
+        if not self._gps_active:
             return
-        self._cancel_gps_watchdog()
-        self._stop_gps()
+        now = time.time()
         try:
-            lat = float(lat)
-            lon = float(lon)
+            lat = float(kwargs["lat"])
+            lon = float(kwargs["lon"])
         except Exception:
-            self._set_status("GPS: некорректные координаты")
+            self.log("gps fix: отброшен — нет/некорректные координаты", kwargs)
             return
-        accuracy = kwargs.get("accuracy")
-        self.log("gps fix:", lat, lon, "accuracy=", accuracy)
+
+        acc_raw = kwargs.get("accuracy")
+        try:
+            accuracy = float(acc_raw) if acc_raw is not None else None
+        except Exception:
+            accuracy = None
+
+        ts_raw = kwargs.get("timestamp")
+        try:
+            ts = float(ts_raw) if ts_raw is not None else now
+        except Exception:
+            ts = now
+
+        self.log(
+            "gps fix:",
+            "lat=", lat,
+            "lon=", lon,
+            "accuracy=", accuracy,
+            "timestamp=", ts,
+            "arrived=", now,
+        )
+
+        # Отбрасываем явно устаревшие / некорректные измерения.
+        if ts < self._gps_last_ts - 1.0:
+            self.log("  -> отклонён: устаревший (out-of-order) fix")
+            return
+        if now - ts > GPS_STALE_AGE:
+            self.log("  -> отклонён: fix старше", GPS_STALE_AGE, "с")
+            return
+        if accuracy is None or accuracy <= 0:
+            self.log("  -> отклонён: нет корректной accuracy")
+            return
+
+        self._gps_last_ts = max(self._gps_last_ts, ts)
+        candidate = {"lat": lat, "lon": lon, "accuracy": accuracy, "ts": ts}
+        self._gps_fixes.append(candidate)
+
+        if self._gps_best is None or accuracy < self._gps_best["accuracy"] - 0.05:
+            self._gps_best = candidate
+            self.log("  -> принят: новый лучший accuracy", accuracy, "м")
+            self._arm_settle()
+        else:
+            self.log(
+                "  -> отклонён: хуже текущего лучшего",
+                self._gps_best["accuracy"], "м",
+            )
+
+        best_acc = self._gps_best["accuracy"]
+        self._set_status(f"Уточнение GPS… ±{best_acc:.0f} м")
+
+        if best_acc <= GPS_GOOD_ACCURACY:
+            self._finish_gps("точность ≤10 м")
+        elif best_acc <= GPS_OK_ACCURACY:
+            self._arm_settle()
+
+    def _finish_gps(self, reason):
+        if not self._gps_active:
+            return
+        self._cancel_gps_timers()
+        self._gps_active = False
+        self._stop_gps()
+        best = self._gps_best
+        if best is None:
+            self.log("gps: завершение —", reason, "| валидных fix нет")
+            self._set_status("GPS: нет сигнала. Проверьте небо и разрешение.")
+            return
+        self.log(
+            "gps: завершение —", reason,
+            "| измерений:", len(self._gps_fixes),
+            "| лучший ±", best["accuracy"], "м",
+        )
         timeout = 3 if self.is_wilderness else 20
-        self.start_update(lat, lon, accuracy=accuracy, source="gps", timeout=timeout)
+        self.start_update(
+            best["lat"], best["lon"],
+            accuracy=best["accuracy"],
+            source="gps",
+            timeout=timeout,
+        )
 
     # --- ЗАПУСК ОБНОВЛЕНИЯ (единая точка, защита от гонок) ---
     def start_update(self, lat, lon, accuracy=None, source="gps", display_name=None, timeout=None):
@@ -714,14 +878,20 @@ class WildVantage(MDApp):
             if gen != self._gen:
                 return
             address = result.get("address") if isinstance(result, dict) else None
+            details = location_pick_details(address)
+            self.log("geocode: GPS coords =", lat, lon)
             self.log(
-                "nominatim address:",
-                {k: address.get(k) for k in ("suburb", "city_district", "neighbourhood", "quarter", "city", "town", "village", "municipality", "county")}
-                if isinstance(address, dict)
-                else None,
+                "geocode: raw Nominatim address =",
+                address if isinstance(address, dict) else None,
             )
-            name = pick_location_name(address)
-            self.log("location name ->", name)
+            self.log(
+                "geocode: selected field ->",
+                (details.get("district_field"), details.get("district"))
+                if details and details.get("district")
+                else ("(город)", details.get("locality")),
+            )
+            name = details["name"] if details else None
+            self.log("geocode: selected location name =", name)
             if name:
                 self._set_location_name(name)
                 self._save_cache()
@@ -729,7 +899,7 @@ class WildVantage(MDApp):
                 self._set_location_name(f"{lat:.5f}, {lon:.5f}")
 
         def error(_req, _err):
-            self.log("nominatim error:", _err)
+            self.log("geocode: nominatim error:", _err)
             if gen == self._gen:
                 self._set_location_name(f"{lat:.5f}, {lon:.5f}")
 
@@ -749,6 +919,7 @@ class WildVantage(MDApp):
                 self.load_cache(gen=gen, show_err=True, requested=self._last_coords)
                 return
             self._last_weather = weather
+            self.log("weather: источник = Open-Meteo (API)")
             self.log(
                 "weather:",
                 "tz=", weather.get("timezone"),
@@ -812,7 +983,7 @@ class WildVantage(MDApp):
         if from_cache:
             self._set_status("⚠️ Нет сети. Данные из кэша.")
         else:
-            self._set_status(f"Обновлено: {fmt_hhmm(cur.get('time'))} ({weather.get('timezone') or '—'})")
+            self._set_status(updated_status_text(cur.get("time")))
 
     def _fill_forecast(self, days):
         try:
@@ -866,13 +1037,22 @@ class WildVantage(MDApp):
             self._set_status("Кэш повреждён — включите интернет")
             return
 
+        is_far = bool(requested) and self._coords_far(requested, coords)
+        if is_far:
+            # Кэш другого места: координаты/название не подменяем на чужие,
+            # показываем текущую GPS-точку, а не прошлую локацию.
+            coords = requested
+        self.log("cache: чтение из файла | кэш другого места =", is_far)
         self._last_weather = weather
         self._last_coords = coords
-        self._set_location_name(record.get("location_name") or "Кэш")
+        if is_far:
+            self._set_location_name(f"{coords.get('lat', 0):.5f}, {coords.get('lon', 0):.5f}")
+        else:
+            self._set_location_name(record.get("location_name") or "Кэш")
         self.process_weather(weather, coords, from_cache=True)
 
         if show_err:
-            if requested and self._coords_far(requested, coords):
+            if is_far:
                 self._set_status("⚠️ Нет сети. Кэш от другого места.")
             else:
                 self._set_status("⚠️ Нет сети. Данные из кэша.")
