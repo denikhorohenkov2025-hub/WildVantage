@@ -11,8 +11,7 @@ from kivy.network.urlrequest import UrlRequest
 from kivymd.app import MDApp
 from kivymd.uix.list import ThreeLineIconListItem, IconLeftWidget
 from kivymd.uix.boxlayout import MDBoxLayout
-from kivymd.uix.label import MDLabel
-from kivymd.uix.icon import MDIcon
+from kivymd.uix.label import MDLabel, MDIcon
 
 # GPS — отдельным try/except, чтобы сбой импорта не ронял приложение
 try:
@@ -697,11 +696,26 @@ class WildVantage(MDApp):
                     self.log("cache: удалён старый файл", old)
             except Exception:
                 pass
-        self.load_cache()
+        # Ошибка обработки кэша не должна закрывать приложение на старте (~2 с).
+        try:
+            self.load_cache()
+        except Exception as e:
+            self._log_exc("load_cache", e)
+            self._set_status("Кэш не читается — включите интернет")
 
     def log(self, *args):
         try:
             print("[WildVantage]", *args)
+        except Exception:
+            pass
+
+    def _log_exc(self, where, exc):
+        """Полный traceback неожиданного исключения в лог, процесс не роняем."""
+        try:
+            import traceback
+            self.log(f"crash-защита: {where}: {type(exc).__name__}: {exc}")
+            for line in traceback.format_exc().splitlines():
+                self.log("  ", line)
         except Exception:
             pass
 
@@ -757,8 +771,12 @@ class WildVantage(MDApp):
                 if state["done"]:
                     return
                 state["done"] = True
-                cb(*a)
-
+                try:
+                    cb(*a)
+                except Exception as e:
+                    # Ошибка в сетевом колбэке не должна ронять процесс:
+                    # логируем полный traceback и продолжаем работать.
+                    self._log_exc("network callback", e)
             return wrapped
 
         def abort(_dt):
@@ -911,11 +929,20 @@ class WildVantage(MDApp):
     def on_gps_status(self, *args):
         # plyer вызывает on_status('provider-disabled'|'provider-status', value)
         # ПОЗИЦИОННО, поэтому принимаем *args, а не **kwargs.
-        self.log("gps status:", args)
-        if args and args[0] == "provider-disabled" and getattr(self, "_gps_active", False):
-            self._set_status("GPS выключен — включите спутники")
+        try:
+            self.log("gps status:", args)
+            if args and args[0] == "provider-disabled" and getattr(self, "_gps_active", False):
+                self._set_status("GPS выключен — включите спутники")
+        except Exception as e:
+            self._log_exc("on_gps_status", e)
 
     def on_gps_loc(self, **kwargs):
+        try:
+            self._on_gps_loc_impl(kwargs)
+        except Exception as e:
+            self._log_exc("on_gps_loc", e)
+
+    def _on_gps_loc_impl(self, kwargs):
         if not self._gps_active:
             return
         now = time.time()
@@ -1172,55 +1199,61 @@ class WildVantage(MDApp):
             return
         row.clear_widgets()
         for h in hours:
-            is_day = True
             try:
-                is_day = bool(int(h.get("is_day", 1)))
-            except Exception:
-                pass
-            _, icon = wmo_info(h.get("code"), is_day)
-            box = MDBoxLayout(
-                orientation="vertical",
-                spacing="2dp",
+                self._build_hour_cell(row, h)
+            except Exception as e:
+                self._log_exc("hour cell", e)
+
+    def _build_hour_cell(self, row, h):
+        is_day = True
+        try:
+            is_day = bool(int(h.get("is_day", 1)))
+        except Exception:
+            pass
+        _, icon = wmo_info(h.get("code"), is_day)
+        box = MDBoxLayout(
+            orientation="vertical",
+            spacing="2dp",
+            size_hint=(None, None),
+            size=("52dp", "88dp"),
+        )
+        box.add_widget(
+            MDLabel(
+                text=fmt_hhmm(h.get("time")),
+                font_size="12sp",
+                halign="center",
                 size_hint=(None, None),
-                size=("52dp", "88dp"),
+                size=("52dp", "18dp"),
+                text_size=(None, None),
+                theme_text_color="Custom",
+                text_color=(0.7, 0.85, 0.7, 1),
             )
-            box.add_widget(
-                MDLabel(
-                    text=fmt_hhmm(h.get("time")),
-                    font_size="12sp",
-                    halign="center",
-                    size_hint=(None, None),
-                    size=("52dp", "18dp"),
-                    text_size=(None, None),
-                    theme_text_color="Custom",
-                    text_color=(0.7, 0.85, 0.7, 1),
-                )
+        )
+        box.add_widget(
+            MDIcon(
+                icon=icon,
+                font_size="22sp",
+                halign="center",
+                theme_text_color="Custom",
+                text_color=(0.85, 1, 0.85, 1),
+                size_hint=(None, None),
+                size=("52dp", "28dp"),
             )
-            box.add_widget(
-                MDIcon(
-                    icon=icon,
-                    font_size="22sp",
-                    halign="center",
-                    theme_text_color="Custom",
-                    text_color=(0.85, 1, 0.85, 1),
-                    size_hint=(None, None),
-                    size=("52dp", "28dp"),
-                )
+        )
+        box.add_widget(
+            MDLabel(
+                text=fmt_temp(h.get("temp")),
+                font_size="14sp",
+                bold=True,
+                halign="center",
+                size_hint=(None, None),
+                size=("52dp", "20dp"),
+                text_size=(None, None),
+                theme_text_color="Custom",
+                text_color=(0.95, 1, 0.95, 1),
             )
-            box.add_widget(
-                MDLabel(
-                    text=fmt_temp(h.get("temp")),
-                    font_size="14sp",
-                    bold=True,
-                    halign="center",
-                    size_hint=(None, None),
-                    size=("52dp", "20dp"),
-                    text_size=(None, None),
-                    theme_text_color="Custom",
-                    text_color=(0.95, 1, 0.95, 1),
-                )
-            )
-            row.add_widget(box)
+        )
+        row.add_widget(box)
 
     def _fill_forecast(self, days):
         try:
@@ -1229,27 +1262,33 @@ class WildVantage(MDApp):
             return
         forecast_list.clear_widgets()
         for day in days:
-            code = day.get("code")
-            d_desc, d_icon = wmo_info(code, True)
-            text = f"{fmt_ddmm(day.get('date'))}  |  {fmt_temp(day.get('tmax'))} / {fmt_temp(day.get('tmin'))}"
-            tertiary = "Осадки: --%"
             try:
-                parts = []
-                if day.get("precip") is not None:
-                    parts.append(f"Осадки: {float(day['precip']):.0f}%")
-                if day.get("wind") is not None:
-                    parts.append(f"Ветер: {float(day['wind']):.0f} м/с")
-                if parts:
-                    tertiary = " · ".join(parts)
-            except Exception:
-                pass
-            item = ThreeLineIconListItem(
-                text=text,
-                secondary_text=d_desc,
-                tertiary_text=tertiary,
-            )
-            item.add_widget(IconLeftWidget(icon=d_icon))
-            forecast_list.add_widget(item)
+                self._build_forecast_item(forecast_list, day)
+            except Exception as e:
+                self._log_exc("forecast item", e)
+
+    def _build_forecast_item(self, forecast_list, day):
+        code = day.get("code")
+        d_desc, d_icon = wmo_info(code, True)
+        text = f"{fmt_ddmm(day.get('date'))}  |  {fmt_temp(day.get('tmax'))} / {fmt_temp(day.get('tmin'))}"
+        tertiary = "Осадки: --%"
+        try:
+            parts = []
+            if day.get("precip") is not None:
+                parts.append(f"Осадки: {float(day['precip']):.0f}%")
+            if day.get("wind") is not None:
+                parts.append(f"Ветер: {float(day['wind']):.0f} м/с")
+            if parts:
+                tertiary = " · ".join(parts)
+        except Exception:
+            pass
+        item = ThreeLineIconListItem(
+            text=text,
+            secondary_text=d_desc,
+            tertiary_text=tertiary,
+        )
+        item.add_widget(IconLeftWidget(icon=d_icon))
+        forecast_list.add_widget(item)
 
     # --- КЭШ ---
     def _save_cache(self):
