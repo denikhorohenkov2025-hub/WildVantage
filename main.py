@@ -10,6 +10,9 @@ from kivy.lang import Builder
 from kivy.network.urlrequest import UrlRequest
 from kivymd.app import MDApp
 from kivymd.uix.list import ThreeLineIconListItem, IconLeftWidget
+from kivymd.uix.boxlayout import MDBoxLayout
+from kivymd.uix.label import MDLabel
+from kivymd.uix.icon import MDIcon
 
 # GPS — отдельным try/except, чтобы сбой импорта не ронял приложение
 try:
@@ -32,14 +35,16 @@ GPS_SETTLE_TIME = 6.0     # сколько ждать улучшения при 
 GPS_STALE_AGE = 8.0       # fix старше этого возраста отбрасываем, сек
 
 # Погода: Open-Meteo (бесплатно, без ключа).
-# current: temperature_2m, weather_code, cloud_cover, is_day
-# daily:   weather_code, temperature_2m_max/min, sunrise, sunset
+# current: температура, ощущается, влажность, ветер, код WMO, облачность, день/ночь
+# hourly:  почасовая температура/осадки/день-ночь — для «Ближайшие 24 ч»
+# daily:   на 7 дней: код WMO, tmax/tmin, восход/закат, вероятность осадков, ветер
 OPEN_METEO_URL = (
     "https://api.open-meteo.com/v1/forecast"
     "?latitude={lat}&longitude={lon}"
-    "&current=temperature_2m,weather_code,cloud_cover,is_day"
-    "&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset"
-    "&timezone=auto&forecast_days=6"
+    "&current=temperature_2m,weather_code,cloud_cover,is_day,apparent_temperature,relative_humidity_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m"
+    "&hourly=temperature_2m,weather_code,is_day,apparent_temperature,precipitation_probability"
+    "&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,precipitation_probability_max,wind_speed_10m_max"
+    "&timezone=auto&forecast_days=7"
 )
 GEOCODE_URL = (
     "https://geocoding-api.open-meteo.com/v1/search"
@@ -193,6 +198,10 @@ def normalize_weather(data):
         return None
     cur = data.get("current") or {}
     daily = data.get("daily") or {}
+    if not isinstance(cur, dict):
+        cur = {}
+    if not isinstance(daily, dict):
+        daily = {}
     dates = daily.get("time") or []
     days = []
     for i in range(len(dates)):
@@ -204,6 +213,24 @@ def normalize_weather(data):
                 "tmin": _at(daily.get("temperature_2m_min"), i),
                 "sunrise": _at(daily.get("sunrise"), i),
                 "sunset": _at(daily.get("sunset"), i),
+                "precip": _at(daily.get("precipitation_probability_max"), i),
+                "wind": _at(daily.get("wind_speed_10m_max"), i),
+            }
+        )
+    hourly = data.get("hourly") or {}
+    if not isinstance(hourly, dict):
+        hourly = {}
+    h_times = hourly.get("time") or []
+    hours = []
+    for i in range(len(h_times)):
+        hours.append(
+            {
+                "time": _at(h_times, i),
+                "temp": _at(hourly.get("temperature_2m"), i),
+                "code": _at(hourly.get("weather_code"), i),
+                "is_day": _at(hourly.get("is_day"), i),
+                "feels": _at(hourly.get("apparent_temperature"), i),
+                "precip": _at(hourly.get("precipitation_probability"), i),
             }
         )
     return {
@@ -213,7 +240,13 @@ def normalize_weather(data):
             "code": cur.get("weather_code"),
             "cloud_cover": cur.get("cloud_cover"),
             "is_day": cur.get("is_day"),
+            "feels": cur.get("apparent_temperature"),
+            "humidity": cur.get("relative_humidity_2m"),
+            "wind_speed": cur.get("wind_speed_10m"),
+            "wind_dir": cur.get("wind_direction_10m"),
+            "wind_gust": cur.get("wind_gusts_10m"),
         },
+        "hours": hours,
         "daily": days,
         "timezone": data.get("timezone"),
         "utc_offset_seconds": data.get("utc_offset_seconds"),
@@ -244,172 +277,166 @@ def fmt_ddmm(iso):
     return "--.--"
 
 
+def humidity_text(value):
+    try:
+        return f"{float(value):.0f}%"
+    except Exception:
+        return "--%"
+
+
+def wind_text(value):
+    try:
+        return f"{float(value):.0f} м/с"
+    except Exception:
+        return "-- м/с"
+
+
+def slice_hours(hours, current_iso, count=24):
+    """Часовые значения, начиная с часа 'сейчас' (для «Ближайшие 24 ч»)."""
+    if not hours:
+        return []
+    start = 0
+    if isinstance(current_iso, str) and len(current_iso) >= 13 and "T" in current_iso:
+        cur = current_iso[11:13]
+        for i, h in enumerate(hours):
+            t = h.get("time")
+            if isinstance(t, str) and len(t) >= 13 and t[11:13] == cur:
+                start = i
+                break
+    return hours[start:start + count]
+
+
 KV = """
 MDScreen:
     md_bg_color: 0.05, 0.08, 0.05, 1
-    MDBoxLayout:
-        orientation: 'vertical'
-        padding: "12dp"
-        spacing: "10dp"
-
-        MDLabel:
-            text: "WILDVANTAGE"
-            halign: "center"
-            bold: True
-            size_hint_y: None
-            height: "40dp"
-            theme_text_color: "Custom"
-            text_color: 0.6, 0.9, 0.6, 1
-
-        # Этаж 1 — Поиск города
+    MDScrollView:
+        do_scroll_x: False
         MDBoxLayout:
             orientation: 'vertical'
+            padding: "12dp"
+            spacing: "10dp"
             adaptive_height: True
-            spacing: "8dp"
-            MDBoxLayout:
-                adaptive_height: True
-                spacing: "5dp"
-                MDTextField:
-                    id: city_input
-                    hint_text: "Введите город"
-                    mode: "round"
-                    input_type: "text"
-                    helper_text_mode: "on_error"
-                    on_text_validate: app.search_logic()
-                MDIconButton:
-                    icon: "magnify"
-                    on_release: app.search_logic()
-
-        # Этаж 2 — Переключатель режима
-        MDBoxLayout:
-            orientation: 'horizontal'
-            adaptive_height: True
-            spacing: "8dp"
-            MDLabel:
-                id: mode_text
-                text: "РЕЖИМ ГОРОД (ONLINE)"
-                bold: True
-                theme_text_color: "Custom"
-                text_color: 0.85, 1, 0.85, 1
-            MDSwitch:
-                id: mode_switch
-                active: False
-                on_active: app.toggle_mode(*args)
-
-        MDCard:
-            orientation: 'vertical'
-            padding: "20dp"
-            spacing: "9dp"
-            size_hint_y: None
-            height: "350dp"
-            radius: 18
-            elevation: 0
-            md_bg_color: 0.1, 0.15, 0.1, 1
-            line_color: 0.2, 0.4, 0.2, 1
 
             MDLabel:
-                id: loc_label
-                text: "Ожидание данных..."
-                halign: "center"
-                font_style: "H6"
-                bold: True
-                shorten: True
-                shorten_from: "center"
-                size_hint_y: None
-                height: "28dp"
-                text_size: self.width, None
-                theme_text_color: "Custom"
-                text_color: 0.9, 1, 0.9, 1
-
-            MDLabel:
-                id: coords_label
-                text: "--"
+                text: "WILDVANTAGE"
                 halign: "center"
                 bold: True
-                font_size: "16sp"
-                shorten: True
                 size_hint_y: None
-                height: "22dp"
-                text_size: self.width, None
+                height: "40dp"
                 theme_text_color: "Custom"
-                text_color: 0.7, 0.9, 0.7, 1
+                text_color: 0.6, 0.9, 0.6, 1
 
-            MDLabel:
-                id: main_temp
-                text: "--°"
-                halign: "center"
-                font_size: "56sp"
-                bold: True
-                size_hint_y: None
-                height: "70dp"
-                theme_text_color: "Custom"
-                text_color: 0.95, 1, 0.95, 1
-
-            # Блок данных под температурой (вертикальный контейнер)
+            # Этаж 1 — Поиск города
             MDBoxLayout:
                 orientation: 'vertical'
                 adaptive_height: True
-                spacing: "10dp"
-                size_hint_x: None
-                width: self.minimum_width
-                pos_hint: {"center_x": .5}
+                spacing: "8dp"
+                MDBoxLayout:
+                    adaptive_height: True
+                    spacing: "5dp"
+                    MDTextField:
+                        id: city_input
+                        hint_text: "Введите город"
+                        mode: "round"
+                        input_type: "text"
+                        helper_text_mode: "on_error"
+                        on_text_validate: app.search_logic()
+                    MDIconButton:
+                        icon: "magnify"
+                        on_release: app.search_logic()
 
-                # Слой 0 — текущее состояние (иконка + описание)
+            # Этаж 2 — Переключатель режима
+            MDBoxLayout:
+                orientation: 'horizontal'
+                adaptive_height: True
+                spacing: "8dp"
+                MDLabel:
+                    id: mode_text
+                    text: "РЕЖИМ ГОРОД (ONLINE)"
+                    bold: True
+                    theme_text_color: "Custom"
+                    text_color: 0.85, 1, 0.85, 1
+                MDSwitch:
+                    id: mode_switch
+                    active: False
+                    on_active: app.toggle_mode(*args)
+
+            MDCard:
+                orientation: 'vertical'
+                padding: "20dp"
+                spacing: "8dp"
+                adaptive_height: True
+                radius: 18
+                elevation: 0
+                md_bg_color: 0.1, 0.15, 0.1, 1
+                line_color: 0.2, 0.4, 0.2, 1
+
+                MDLabel:
+                    id: loc_label
+                    text: "Ожидание данных..."
+                    halign: "center"
+                    font_style: "H6"
+                    bold: True
+                    shorten: True
+                    shorten_from: "center"
+                    size_hint_y: None
+                    height: "28dp"
+                    text_size: self.width, None
+                    theme_text_color: "Custom"
+                    text_color: 0.9, 1, 0.9, 1
+
+                MDLabel:
+                    id: coords_label
+                    text: "--"
+                    halign: "center"
+                    bold: True
+                    font_size: "16sp"
+                    shorten: True
+                    size_hint_y: None
+                    height: "22dp"
+                    text_size: self.width, None
+                    theme_text_color: "Custom"
+                    text_color: 0.7, 0.9, 0.7, 1
+
+                MDLabel:
+                    id: main_temp
+                    text: "--°"
+                    halign: "center"
+                    font_size: "56sp"
+                    bold: True
+                    size_hint_y: None
+                    height: "70dp"
+                    theme_text_color: "Custom"
+                    text_color: 0.95, 1, 0.95, 1
+
+                # Детали «сейчас»: ощущается, влажность, ветер
                 MDBoxLayout:
                     orientation: 'horizontal'
                     adaptive_height: True
-                    spacing: "6dp"
-                    size_hint_x: None
-                    width: self.minimum_width
-                    pos_hint: {"center_x": .5}
-                    MDIcon:
-                        id: current_icon
-                        icon: "update"
-                        font_size: "22sp"
-                        size_hint: None, None
-                        size: "22dp", "22dp"
-                        theme_text_color: "Custom"
-                        text_color: 0.95, 1, 0.95, 1
-                    MDLabel:
-                        id: current_desc_label
-                        text: "Загрузка..."
-                        font_size: "15sp"
-                        size_hint: None, None
-                        width: self.texture_size[0]
-                        height: self.texture_size[1]
-                        text_size: None, None
-                        halign: 'center'
-                        theme_text_color: "Custom"
-                        text_color: 0.85, 1, 0.85, 1
-
-                # Слой 1 — восход и закат (горизонтально, далеко друг от друга)
-                MDBoxLayout:
-                    orientation: 'horizontal'
-                    adaptive_height: True
-                    spacing: "40dp"
+                    spacing: "18dp"
                     size_hint_x: None
                     width: self.minimum_width
                     pos_hint: {"center_x": .5}
                     MDBoxLayout:
                         orientation: 'horizontal'
                         adaptive_height: True
-                        spacing: "5dp"
+                        spacing: "4dp"
                         size_hint_x: None
                         width: self.minimum_width
                         MDIcon:
-                            icon: "weather-sunset-up"
-                            font_size: "24sp"
+                            icon: "thermometer"
+                            font_size: "18sp"
                             size_hint: None, None
-                            size: "24dp", "24dp"
+                            size: "18dp", "18dp"
                             theme_text_color: "Custom"
                             text_color: 0.95, 0.85, 0.45, 1
                         MDLabel:
-                            id: sunrise_label
-                            text: "--:--"
-                            font_size: "16sp"
+                            id: feels_label
+                            text: "--°"
+                            font_size: "15sp"
                             size_hint: None, None
                             width: self.texture_size[0]
-                            height: "24dp"
+                            height: self.texture_size[1]
                             text_size: None, None
                             halign: 'center'
                             theme_text_color: "Custom"
@@ -417,71 +444,210 @@ MDScreen:
                     MDBoxLayout:
                         orientation: 'horizontal'
                         adaptive_height: True
-                        spacing: "5dp"
+                        spacing: "4dp"
                         size_hint_x: None
                         width: self.minimum_width
                         MDIcon:
-                            icon: "weather-sunset-down"
-                            font_size: "24sp"
+                            icon: "water-percent"
+                            font_size: "18sp"
                             size_hint: None, None
-                            size: "24dp", "24dp"
+                            size: "18dp", "18dp"
                             theme_text_color: "Custom"
-                            text_color: 0.95, 0.6, 0.4, 1
+                            text_color: 0.45, 0.7, 0.95, 1
                         MDLabel:
-                            id: sunset_label
-                            text: "--:--"
-                            font_size: "16sp"
+                            id: humidity_label
+                            text: "--%"
+                            font_size: "15sp"
                             size_hint: None, None
                             width: self.texture_size[0]
-                            height: "24dp"
+                            height: self.texture_size[1]
+                            text_size: None, None
+                            halign: 'center'
+                            theme_text_color: "Custom"
+                            text_color: 0.85, 1, 0.85, 1
+                    MDBoxLayout:
+                        orientation: 'horizontal'
+                        adaptive_height: True
+                        spacing: "4dp"
+                        size_hint_x: None
+                        width: self.minimum_width
+                        MDIcon:
+                            icon: "weather-windy"
+                            font_size: "18sp"
+                            size_hint: None, None
+                            size: "18dp", "18dp"
+                            theme_text_color: "Custom"
+                            text_color: 0.6, 0.85, 0.6, 1
+                        MDLabel:
+                            id: wind_label
+                            text: "-- м/с"
+                            font_size: "15sp"
+                            size_hint: None, None
+                            width: self.texture_size[0]
+                            height: self.texture_size[1]
                             text_size: None, None
                             halign: 'center'
                             theme_text_color: "Custom"
                             text_color: 0.85, 1, 0.85, 1
 
-                # Слой 2 — Обновлено (под восходом/закатом)
+                # Блок данных под температурой (вертикальный контейнер)
                 MDBoxLayout:
-                    orientation: 'horizontal'
+                    orientation: 'vertical'
                     adaptive_height: True
-                    spacing: "6dp"
+                    spacing: "10dp"
                     size_hint_x: None
                     width: self.minimum_width
                     pos_hint: {"center_x": .5}
-                    MDIcon:
-                        icon: "update"
-                        font_size: "16sp"
-                        size_hint: None, None
-                        size: "16dp", "16dp"
-                        theme_text_color: "Custom"
-                        text_color: 0.55, 0.75, 0.55, 1
-                    MDLabel:
-                        id: status_label
-                        text: "Система готова"
-                        font_size: "13sp"
-                        size_hint: None, None
-                        width: self.texture_size[0]
-                        height: self.texture_size[1]
-                        text_size: None, None
-                        halign: 'center'
-                        theme_text_color: "Custom"
-                        text_color: 0.55, 0.75, 0.55, 1
 
-            MDFillRoundFlatButton:
-                text: "ОБНОВИТЬ GPS"
-                pos_hint: {"center_x": .5}
-                size_hint_x: 0.9
-                md_bg_color: 0.2, 0.4, 0.2, 1
-                on_release: app.run_gps_logic()
+                    # Слой 0 — текущее состояние (иконка + описание)
+                    MDBoxLayout:
+                        orientation: 'horizontal'
+                        adaptive_height: True
+                        spacing: "6dp"
+                        size_hint_x: None
+                        width: self.minimum_width
+                        pos_hint: {"center_x": .5}
+                        MDIcon:
+                            id: current_icon
+                            icon: "update"
+                            font_size: "22sp"
+                            size_hint: None, None
+                            size: "22dp", "22dp"
+                            theme_text_color: "Custom"
+                            text_color: 0.95, 1, 0.95, 1
+                        MDLabel:
+                            id: current_desc_label
+                            text: "Загрузка..."
+                            font_size: "15sp"
+                            size_hint: None, None
+                            width: self.texture_size[0]
+                            height: self.texture_size[1]
+                            text_size: None, None
+                            halign: 'center'
+                            theme_text_color: "Custom"
+                            text_color: 0.85, 1, 0.85, 1
 
-        MDLabel:
-            text: "ПРОГНОЗ НА 5 ДНЕЙ"
-            bold: True
-            size_hint_y: None
-            height: "24dp"
-            theme_text_color: "Custom"
-            text_color: 0.6, 0.9, 0.6, 1
+                    # Слой 1 — восход и закат (горизонтально, далеко друг от друга)
+                    MDBoxLayout:
+                        orientation: 'horizontal'
+                        adaptive_height: True
+                        spacing: "40dp"
+                        size_hint_x: None
+                        width: self.minimum_width
+                        pos_hint: {"center_x": .5}
+                        MDBoxLayout:
+                            orientation: 'horizontal'
+                            adaptive_height: True
+                            spacing: "5dp"
+                            size_hint_x: None
+                            width: self.minimum_width
+                            MDIcon:
+                                icon: "weather-sunset-up"
+                                font_size: "24sp"
+                                size_hint: None, None
+                                size: "24dp", "24dp"
+                                theme_text_color: "Custom"
+                                text_color: 0.95, 0.85, 0.45, 1
+                            MDLabel:
+                                id: sunrise_label
+                                text: "--:--"
+                                font_size: "16sp"
+                                size_hint: None, None
+                                width: self.texture_size[0]
+                                height: "24dp"
+                                text_size: None, None
+                                halign: 'center'
+                                theme_text_color: "Custom"
+                                text_color: 0.85, 1, 0.85, 1
+                        MDBoxLayout:
+                            orientation: 'horizontal'
+                            adaptive_height: True
+                            spacing: "5dp"
+                            size_hint_x: None
+                            width: self.minimum_width
+                            MDIcon:
+                                icon: "weather-sunset-down"
+                                font_size: "24sp"
+                                size_hint: None, None
+                                size: "24dp", "24dp"
+                                theme_text_color: "Custom"
+                                text_color: 0.95, 0.6, 0.4, 1
+                            MDLabel:
+                                id: sunset_label
+                                text: "--:--"
+                                font_size: "16sp"
+                                size_hint: None, None
+                                width: self.texture_size[0]
+                                height: "24dp"
+                                text_size: None, None
+                                halign: 'center'
+                                theme_text_color: "Custom"
+                                text_color: 0.85, 1, 0.85, 1
 
-        MDScrollView:
+                    # Слой 2 — Обновлено (под восходом/закатом)
+                    MDBoxLayout:
+                        orientation: 'horizontal'
+                        adaptive_height: True
+                        spacing: "6dp"
+                        size_hint_x: None
+                        width: self.minimum_width
+                        pos_hint: {"center_x": .5}
+                        MDIcon:
+                            icon: "update"
+                            font_size: "16sp"
+                            size_hint: None, None
+                            size: "16dp", "16dp"
+                            theme_text_color: "Custom"
+                            text_color: 0.55, 0.75, 0.55, 1
+                        MDLabel:
+                            id: status_label
+                            text: "Система готова"
+                            font_size: "13sp"
+                            size_hint: None, None
+                            width: self.texture_size[0]
+                            height: self.texture_size[1]
+                            text_size: None, None
+                            halign: 'center'
+                            theme_text_color: "Custom"
+                            text_color: 0.55, 0.75, 0.55, 1
+
+                MDFillRoundFlatButton:
+                    text: "ОБНОВИТЬ GPS"
+                    pos_hint: {"center_x": .5}
+                    size_hint_x: 0.9
+                    md_bg_color: 0.2, 0.4, 0.2, 1
+                    on_release: app.run_gps_logic()
+
+            # Ближайшие 24 ч — горизонтальный скролл
+            MDLabel:
+                text: "БЛИЖАЙШИЕ 24 Ч"
+                bold: True
+                size_hint_y: None
+                height: "20dp"
+                theme_text_color: "Custom"
+                text_color: 0.6, 0.9, 0.6, 1
+
+            MDScrollView:
+                height: "92dp"
+                size_hint_y: None
+                do_scroll_x: True
+                do_scroll_y: False
+                bar_width: "4dp"
+                MDBoxLayout:
+                    id: hourly_row
+                    orientation: 'horizontal'
+                    size_hint_x: None
+                    width: self.minimum_width
+                    spacing: "6dp"
+
+            MDLabel:
+                text: "ПРОГНОЗ НА 7 ДНЕЙ"
+                bold: True
+                size_hint_y: None
+                height: "20dp"
+                theme_text_color: "Custom"
+                text_color: 0.6, 0.9, 0.6, 1
+
             MDList:
                 id: forecast_list
                 spacing: "6dp"
@@ -848,7 +1014,11 @@ class WildVantage(MDApp):
         try:
             root = self.root.ids
             root.forecast_list.clear_widgets()
+            root.hourly_row.clear_widgets()
             root.main_temp.text = "--°"
+            root.feels_label.text = "--°"
+            root.humidity_label.text = "--%"
+            root.wind_label.text = "-- м/с"
             root.sunrise_label.text = "--:--"
             root.sunset_label.text = "--:--"
             root.current_desc_label.text = "Загрузка..."
@@ -929,7 +1099,11 @@ class WildVantage(MDApp):
                 "code=", weather["current"].get("code"),
                 "cloud=", weather["current"].get("cloud_cover"),
                 "is_day=", weather["current"].get("is_day"),
+                "feels=", weather["current"].get("feels"),
+                "humidity=", weather["current"].get("humidity"),
+                "wind_speed=", weather["current"].get("wind_speed"),
             )
+            self.log("weather: часовых значений =", len(weather.get("hours") or []))
             self.process_weather(weather, self._last_coords)
             self._save_cache()
 
@@ -962,6 +1136,9 @@ class WildVantage(MDApp):
             root.main_temp.text = fmt_temp(cur.get("temp"))
             root.current_desc_label.text = desc
             root.current_icon.icon = icon
+            root.feels_label.text = fmt_temp(cur.get("feels"))
+            root.humidity_label.text = humidity_text(cur.get("humidity"))
+            root.wind_label.text = wind_text(cur.get("wind_speed"))
             if coords.get("lat") is not None and coords.get("lon") is not None:
                 self._set_coords_text(coords["lat"], coords["lon"], coords.get("accuracy"))
             if self._loc_name:
@@ -969,6 +1146,8 @@ class WildVantage(MDApp):
             root.forecast_list.clear_widgets()
         except Exception:
             pass
+
+        self._fill_hours(slice_hours(weather.get("hours") or [], cur.get("time")))
 
         if days:
             today = days[0]
@@ -978,12 +1157,70 @@ class WildVantage(MDApp):
                 self.root.ids.sunset_label.text = fmt_hhmm(today.get("sunset"))
             except Exception:
                 pass
-            self._fill_forecast(days[:5])
+            self._fill_forecast(days[:7])
 
         if from_cache:
             self._set_status("⚠️ Нет сети. Данные из кэша.")
         else:
             self._set_status(updated_status_text(cur.get("time")))
+
+    def _fill_hours(self, hours):
+        """Строит почасовые ячейки «Ближайшие 24 ч» (иконка, время, °)."""
+        try:
+            row = self.root.ids.hourly_row
+        except Exception:
+            return
+        row.clear_widgets()
+        for h in hours:
+            is_day = True
+            try:
+                is_day = bool(int(h.get("is_day", 1)))
+            except Exception:
+                pass
+            _, icon = wmo_info(h.get("code"), is_day)
+            box = MDBoxLayout(
+                orientation="vertical",
+                spacing="2dp",
+                size_hint=(None, None),
+                size=("52dp", "88dp"),
+            )
+            box.add_widget(
+                MDLabel(
+                    text=fmt_hhmm(h.get("time")),
+                    font_size="12sp",
+                    halign="center",
+                    size_hint=(None, None),
+                    size=("52dp", "18dp"),
+                    text_size=(None, None),
+                    theme_text_color="Custom",
+                    text_color=(0.7, 0.85, 0.7, 1),
+                )
+            )
+            box.add_widget(
+                MDIcon(
+                    icon=icon,
+                    font_size="22sp",
+                    halign="center",
+                    theme_text_color="Custom",
+                    text_color=(0.85, 1, 0.85, 1),
+                    size_hint=(None, None),
+                    size=("52dp", "28dp"),
+                )
+            )
+            box.add_widget(
+                MDLabel(
+                    text=fmt_temp(h.get("temp")),
+                    font_size="14sp",
+                    bold=True,
+                    halign="center",
+                    size_hint=(None, None),
+                    size=("52dp", "20dp"),
+                    text_size=(None, None),
+                    theme_text_color="Custom",
+                    text_color=(0.95, 1, 0.95, 1),
+                )
+            )
+            row.add_widget(box)
 
     def _fill_forecast(self, days):
         try:
@@ -995,7 +1232,22 @@ class WildVantage(MDApp):
             code = day.get("code")
             d_desc, d_icon = wmo_info(code, True)
             text = f"{fmt_ddmm(day.get('date'))}  |  {fmt_temp(day.get('tmax'))} / {fmt_temp(day.get('tmin'))}"
-            item = ThreeLineIconListItem(text=text, secondary_text=d_desc)
+            tertiary = "Осадки: --%"
+            try:
+                parts = []
+                if day.get("precip") is not None:
+                    parts.append(f"Осадки: {float(day['precip']):.0f}%")
+                if day.get("wind") is not None:
+                    parts.append(f"Ветер: {float(day['wind']):.0f} м/с")
+                if parts:
+                    tertiary = " · ".join(parts)
+            except Exception:
+                pass
+            item = ThreeLineIconListItem(
+                text=text,
+                secondary_text=d_desc,
+                tertiary_text=tertiary,
+            )
             item.add_widget(IconLeftWidget(icon=d_icon))
             forecast_list.add_widget(item)
 

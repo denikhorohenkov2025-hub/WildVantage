@@ -11,7 +11,7 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,json
 
 # Можно поднять при релизе
-version = 12.9
+version = 13.0
 
 requirements = python3,kivy==2.2.1,kivymd==1.1.1,plyer,pillow,urllib3,certifi
 
