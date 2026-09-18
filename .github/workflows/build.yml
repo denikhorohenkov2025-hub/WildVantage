@@ -5,6 +5,9 @@ on:
   push:
     branches: [main, master]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -91,3 +94,50 @@ jobs:
           name: wildvantage-apk
           path: bin/*.apk
           if-no-files-found: error
+
+      - name: Determine version from buildozer.spec
+        id: ver
+        run: |
+          ver=$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' buildozer.spec | head -1 | tr -d ' \r')
+          echo "APK_VERSION=$ver" >> "$GITHUB_ENV"
+          echo "TAG=v${ver}-test" >> "$GITHUB_ENV"
+          echo "version=$ver"
+
+      - name: Prepare release APK (arm64-v8a by preference)
+        run: |
+          src=$(ls bin/*arm64* 2>/dev/null | head -1)
+          if [ -z "$src" ]; then src=$(ls bin/*.apk 2>/dev/null | head -1); fi
+          echo "source=$src"
+          cp "$src" "bin/WILDVANTAGE-v${APK_VERSION}.apk"
+          ls -la bin/
+
+      - name: Check if test release already exists
+        id: chk
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG}")
+          echo "api_status=$code"
+          if [ "$code" = "200" ]; then echo "EXISTS=1" >> "$GITHUB_ENV"; else echo "EXISTS=0" >> "$GITHUB_ENV"; fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create test prerelease v${{ env.APK_VERSION }}-test
+        if: success() && env.EXISTS == '0'
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ env.APK_VERSION }}-test
+          name: WildVantage v${{ env.APK_VERSION }} (тестовый prerelease)
+          body: |
+            Тестовая сборка WildVantage v${{ env.APK_VERSION }}.
+
+            Изменения в v13.0.1:
+            - фикс краша на старте (MDIcon импортируется из kivymd.uix.label, а не несуществующего kivymd.uix.icon);
+            - защита сетевых/GPS колбэков и стартового чтения кэша от падения процесса.
+          draft: false
+          prerelease: true
+          files: bin/WILDVANTAGE-v${{ env.APK_VERSION }}.apk
+          fail_on_unmatched_files: true
