@@ -1,4 +1,4 @@
-﻿[app]
+[app]
 
 title = WildVantage
 
