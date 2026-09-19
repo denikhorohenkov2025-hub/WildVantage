@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import time
 import urllib.parse
@@ -11,6 +11,7 @@ from kivy.network.urlrequest import UrlRequest
 from kivymd.app import MDApp
 from kivymd.uix.list import ThreeLineIconListItem, IconLeftWidget
 from kivymd.uix.boxlayout import MDBoxLayout
+from kivymd.uix.floatlayout import MDFloatLayout
 from kivymd.uix.label import MDLabel, MDIcon
 
 # GPS — отдельным try/except, чтобы сбой импорта не ронял приложение
@@ -308,13 +309,24 @@ def slice_hours(hours, current_iso, count=24):
 KV = """
 MDScreen:
     md_bg_color: 0.05, 0.08, 0.05, 1
+
     MDScrollView:
+        id: main_scroll
         do_scroll_x: False
+        bar_width: "4dp"
         MDBoxLayout:
             orientation: 'vertical'
-            padding: "12dp"
+            size_hint_y: None
+            height: self.minimum_height
+            padding: ["12dp", "12dp", "12dp", "12dp"]
             spacing: "10dp"
-            adaptive_height: True
+
+            # Отступ под системные insets (status bar сверху / nav bar снизу).
+            # Высота ставится из Android API в on_start (0 на десктопе).
+            MDBoxLayout:
+                id: header_spacer
+                size_hint_y: None
+                height: "0dp"
 
             MDLabel:
                 text: "WILDVANTAGE"
@@ -322,32 +334,36 @@ MDScreen:
                 bold: True
                 size_hint_y: None
                 height: "40dp"
+                font_size: "22sp"
                 theme_text_color: "Custom"
                 text_color: 0.6, 0.9, 0.6, 1
 
-            # Этаж 1 — Поиск города
-            MDBoxLayout:
-                orientation: 'vertical'
-                adaptive_height: True
-                spacing: "8dp"
-                MDBoxLayout:
-                    adaptive_height: True
-                    spacing: "5dp"
-                    MDTextField:
-                        id: city_input
-                        hint_text: "Введите город"
-                        mode: "round"
-                        input_type: "text"
-                        helper_text_mode: "on_error"
-                        on_text_validate: app.search_logic()
-                    MDIconButton:
-                        icon: "magnify"
-                        on_release: app.search_logic()
-
-            # Этаж 2 — Переключатель режима
+            # Поиск города
             MDBoxLayout:
                 orientation: 'horizontal'
-                adaptive_height: True
+                size_hint_y: None
+                height: "48dp"
+                spacing: "6dp"
+                MDTextField:
+                    id: city_input
+                    hint_text: "Введите город"
+                    mode: "round"
+                    size_hint_y: None
+                    height: "48dp"
+                    helper_text_mode: "on_error"
+                    on_text_validate: app.search_logic()
+                MDIconButton:
+                    icon: "magnify"
+                    size_hint_y: None
+                    size_hint_x: None
+                    size: "48dp", "48dp"
+                    on_release: app.search_logic()
+
+            # Переключатель режима
+            MDBoxLayout:
+                orientation: 'horizontal'
+                size_hint_y: None
+                height: self.minimum_height
                 spacing: "8dp"
                 MDLabel:
                     id: mode_text
@@ -360,11 +376,13 @@ MDScreen:
                     active: False
                     on_active: app.toggle_mode(*args)
 
+            # Карточка «Сейчас»
             MDCard:
                 orientation: 'vertical'
-                padding: "20dp"
+                size_hint_y: None
+                height: self.minimum_height
+                padding: ["16dp", "14dp", "16dp", "14dp"]
                 spacing: "8dp"
-                adaptive_height: True
                 radius: 18
                 elevation: 0
                 md_bg_color: 0.1, 0.15, 0.1, 1
@@ -379,7 +397,8 @@ MDScreen:
                     shorten: True
                     shorten_from: "center"
                     size_hint_y: None
-                    height: "28dp"
+                    height: "30dp"
+                    valign: "middle"
                     text_size: self.width, None
                     theme_text_color: "Custom"
                     text_color: 0.9, 1, 0.9, 1
@@ -389,10 +408,11 @@ MDScreen:
                     text: "--"
                     halign: "center"
                     bold: True
-                    font_size: "16sp"
+                    font_size: "15sp"
                     shorten: True
                     size_hint_y: None
                     height: "22dp"
+                    valign: "middle"
                     text_size: self.width, None
                     theme_text_color: "Custom"
                     text_color: 0.7, 0.9, 0.7, 1
@@ -401,111 +421,101 @@ MDScreen:
                     id: main_temp
                     text: "--°"
                     halign: "center"
-                    font_size: "56sp"
+                    font_size: "52sp"
                     bold: True
                     size_hint_y: None
-                    height: "70dp"
+                    height: "66dp"
+                    valign: "middle"
+                    text_size: self.width, None
                     theme_text_color: "Custom"
                     text_color: 0.95, 1, 0.95, 1
 
-                # Детали «сейчас»: ощущается, влажность, ветер
+                # Детали «сейчас»: ощущается | влажность | ветер
                 MDBoxLayout:
                     orientation: 'horizontal'
-                    adaptive_height: True
-                    spacing: "18dp"
-                    size_hint_x: None
-                    width: self.minimum_width
-                    pos_hint: {"center_x": .5}
-                    MDBoxLayout:
-                        orientation: 'horizontal'
-                        adaptive_height: True
-                        spacing: "4dp"
-                        size_hint_x: None
-                        width: self.minimum_width
-                        MDIcon:
-                            icon: "thermometer"
-                            font_size: "18sp"
+                    size_hint_y: None
+                    height: "24dp"
+                    MDFloatLayout:
+                        size_hint_x: 1
+                        MDBoxLayout:
                             size_hint: None, None
-                            size: "18dp", "18dp"
-                            theme_text_color: "Custom"
-                            text_color: 0.95, 0.85, 0.45, 1
-                        MDLabel:
-                            id: feels_label
-                            text: "--°"
-                            font_size: "15sp"
+                            width: self.minimum_width
+                            height: self.minimum_height
+                            pos_hint: {"center_x": .5, "center_y": .5}
+                            MDIcon:
+                                icon: "thermometer"
+                                font_size: "18sp"
+                                size_hint: None, None
+                                size: "18dp", "18dp"
+                                theme_text_color: "Custom"
+                                text_color: 0.95, 0.85, 0.45, 1
+                            MDLabel:
+                                id: feels_label
+                                text: "--°"
+                                font_size: "15sp"
+                                size_hint: None, None
+                                width: "64dp"
+                                height: "22dp"
+                                theme_text_color: "Custom"
+                                text_color: 0.85, 1, 0.85, 1
+                    MDFloatLayout:
+                        size_hint_x: 1
+                        MDBoxLayout:
                             size_hint: None, None
-                            width: self.texture_size[0]
-                            height: self.texture_size[1]
-                            text_size: None, None
-                            halign: 'center'
-                            theme_text_color: "Custom"
-                            text_color: 0.85, 1, 0.85, 1
-                    MDBoxLayout:
-                        orientation: 'horizontal'
-                        adaptive_height: True
-                        spacing: "4dp"
-                        size_hint_x: None
-                        width: self.minimum_width
-                        MDIcon:
-                            icon: "water-percent"
-                            font_size: "18sp"
+                            width: self.minimum_width
+                            height: self.minimum_height
+                            pos_hint: {"center_x": .5, "center_y": .5}
+                            MDIcon:
+                                icon: "water-percent"
+                                font_size: "18sp"
+                                size_hint: None, None
+                                size: "18dp", "18dp"
+                                theme_text_color: "Custom"
+                                text_color: 0.45, 0.7, 0.95, 1
+                            MDLabel:
+                                id: humidity_label
+                                text: "--%"
+                                font_size: "15sp"
+                                size_hint: None, None
+                                width: "64dp"
+                                height: "22dp"
+                                theme_text_color: "Custom"
+                                text_color: 0.85, 1, 0.85, 1
+                    MDFloatLayout:
+                        size_hint_x: 1
+                        MDBoxLayout:
                             size_hint: None, None
-                            size: "18dp", "18dp"
-                            theme_text_color: "Custom"
-                            text_color: 0.45, 0.7, 0.95, 1
-                        MDLabel:
-                            id: humidity_label
-                            text: "--%"
-                            font_size: "15sp"
-                            size_hint: None, None
-                            width: self.texture_size[0]
-                            height: self.texture_size[1]
-                            text_size: None, None
-                            halign: 'center'
-                            theme_text_color: "Custom"
-                            text_color: 0.85, 1, 0.85, 1
-                    MDBoxLayout:
-                        orientation: 'horizontal'
-                        adaptive_height: True
-                        spacing: "4dp"
-                        size_hint_x: None
-                        width: self.minimum_width
-                        MDIcon:
-                            icon: "weather-windy"
-                            font_size: "18sp"
-                            size_hint: None, None
-                            size: "18dp", "18dp"
-                            theme_text_color: "Custom"
-                            text_color: 0.6, 0.85, 0.6, 1
-                        MDLabel:
-                            id: wind_label
-                            text: "-- м/с"
-                            font_size: "15sp"
-                            size_hint: None, None
-                            width: self.texture_size[0]
-                            height: self.texture_size[1]
-                            text_size: None, None
-                            halign: 'center'
-                            theme_text_color: "Custom"
-                            text_color: 0.85, 1, 0.85, 1
+                            width: self.minimum_width
+                            height: self.minimum_height
+                            pos_hint: {"center_x": .5, "center_y": .5}
+                            MDIcon:
+                                icon: "weather-windy"
+                                font_size: "18sp"
+                                size_hint: None, None
+                                size: "18dp", "18dp"
+                                theme_text_color: "Custom"
+                                text_color: 0.6, 0.85, 0.6, 1
+                            MDLabel:
+                                id: wind_label
+                                text: "-- м/с"
+                                font_size: "15sp"
+                                size_hint: None, None
+                                width: "80dp"
+                                height: "22dp"
+                                theme_text_color: "Custom"
+                                text_color: 0.85, 1, 0.85, 1
 
-                # Блок данных под температурой (вертикальный контейнер)
+                # Состояние: иконка + описание
                 MDBoxLayout:
-                    orientation: 'vertical'
-                    adaptive_height: True
-                    spacing: "10dp"
-                    size_hint_x: None
-                    width: self.minimum_width
-                    pos_hint: {"center_x": .5}
-
-                    # Слой 0 — текущее состояние (иконка + описание)
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: self.minimum_height
                     MDBoxLayout:
-                        orientation: 'horizontal'
-                        adaptive_height: True
-                        spacing: "6dp"
-                        size_hint_x: None
+                        size_hint_x: 1
+                    MDBoxLayout:
+                        size_hint: None, None
                         width: self.minimum_width
-                        pos_hint: {"center_x": .5}
+                        height: self.minimum_height
                         MDIcon:
                             id: current_icon
                             icon: "update"
@@ -517,34 +527,36 @@ MDScreen:
                         MDLabel:
                             id: current_desc_label
                             text: "Загрузка..."
-                            font_size: "15sp"
+                            font_size: "16sp"
                             size_hint: None, None
-                            width: self.texture_size[0]
-                            height: self.texture_size[1]
-                            text_size: None, None
-                            halign: 'center'
+                            width: "235dp"
+                            height: "24dp"
+                            shorten: True
+                            text_size: self.width, None
+                            halign: "center"
+                            valign: "middle"
                             theme_text_color: "Custom"
                             text_color: 0.85, 1, 0.85, 1
-
-                    # Слой 1 — восход и закат (горизонтально, далеко друг от друга)
                     MDBoxLayout:
-                        orientation: 'horizontal'
-                        adaptive_height: True
-                        spacing: "40dp"
-                        size_hint_x: None
-                        width: self.minimum_width
-                        pos_hint: {"center_x": .5}
+                        size_hint_x: 1
+
+                # Восход / закат
+                MDBoxLayout:
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: "24dp"
+                    MDFloatLayout:
+                        size_hint_x: 1
                         MDBoxLayout:
-                            orientation: 'horizontal'
-                            adaptive_height: True
-                            spacing: "5dp"
-                            size_hint_x: None
+                            size_hint: None, None
                             width: self.minimum_width
+                            height: self.minimum_height
+                            pos_hint: {"center_x": .5, "center_y": .5}
                             MDIcon:
                                 icon: "weather-sunset-up"
-                                font_size: "24sp"
+                                font_size: "22sp"
                                 size_hint: None, None
-                                size: "24dp", "24dp"
+                                size: "22dp", "22dp"
                                 theme_text_color: "Custom"
                                 text_color: 0.95, 0.85, 0.45, 1
                             MDLabel:
@@ -552,23 +564,22 @@ MDScreen:
                                 text: "--:--"
                                 font_size: "16sp"
                                 size_hint: None, None
-                                width: self.texture_size[0]
+                                width: "52dp"
                                 height: "24dp"
-                                text_size: None, None
-                                halign: 'center'
                                 theme_text_color: "Custom"
                                 text_color: 0.85, 1, 0.85, 1
+                    MDFloatLayout:
+                        size_hint_x: 1
                         MDBoxLayout:
-                            orientation: 'horizontal'
-                            adaptive_height: True
-                            spacing: "5dp"
-                            size_hint_x: None
+                            size_hint: None, None
                             width: self.minimum_width
+                            height: self.minimum_height
+                            pos_hint: {"center_x": .5, "center_y": .5}
                             MDIcon:
                                 icon: "weather-sunset-down"
-                                font_size: "24sp"
+                                font_size: "22sp"
                                 size_hint: None, None
-                                size: "24dp", "24dp"
+                                size: "22dp", "22dp"
                                 theme_text_color: "Custom"
                                 text_color: 0.95, 0.6, 0.4, 1
                             MDLabel:
@@ -576,46 +587,41 @@ MDScreen:
                                 text: "--:--"
                                 font_size: "16sp"
                                 size_hint: None, None
-                                width: self.texture_size[0]
+                                width: "52dp"
                                 height: "24dp"
-                                text_size: None, None
-                                halign: 'center'
                                 theme_text_color: "Custom"
                                 text_color: 0.85, 1, 0.85, 1
 
-                    # Слой 2 — Обновлено (под восходом/закатом)
-                    MDBoxLayout:
-                        orientation: 'horizontal'
-                        adaptive_height: True
-                        spacing: "6dp"
-                        size_hint_x: None
-                        width: self.minimum_width
-                        pos_hint: {"center_x": .5}
-                        MDIcon:
-                            icon: "update"
-                            font_size: "16sp"
-                            size_hint: None, None
-                            size: "16dp", "16dp"
-                            theme_text_color: "Custom"
-                            text_color: 0.55, 0.75, 0.55, 1
-                        MDLabel:
-                            id: status_label
-                            text: "Система готова"
-                            font_size: "13sp"
-                            size_hint: None, None
-                            width: self.texture_size[0]
-                            height: self.texture_size[1]
-                            text_size: None, None
-                            halign: 'center'
-                            theme_text_color: "Custom"
-                            text_color: 0.55, 0.75, 0.55, 1
+                # Статус обновления
+                MDLabel:
+                    id: status_label
+                    text: "Система готова"
+                    halign: "center"
+                    valign: "middle"
+                    font_size: "13sp"
+                    size_hint_y: None
+                    height: "20dp"
+                    text_size: self.width, None
+                    theme_text_color: "Custom"
+                    text_color: 0.55, 0.75, 0.55, 1
 
-                MDFillRoundFlatButton:
-                    text: "ОБНОВИТЬ GPS"
-                    pos_hint: {"center_x": .5}
-                    size_hint_x: 0.9
-                    md_bg_color: 0.2, 0.4, 0.2, 1
-                    on_release: app.run_gps_logic()
+                # Кнопка Обновить GPS (центрируется по ширине)
+                MDBoxLayout:
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: self.minimum_height
+                    MDBoxLayout:
+                        size_hint_x: 1
+                    MDFillRoundFlatButton:
+                        text: "ОБНОВИТЬ GPS"
+                        size_hint_x: None
+                        width: "240dp"
+                        size_hint_y: None
+                        height: "44dp"
+                        md_bg_color: 0.2, 0.4, 0.2, 1
+                        on_release: app.run_gps_logic()
+                    MDBoxLayout:
+                        size_hint_x: 1
 
             # Ближайшие 24 ч — горизонтальный скролл
             MDLabel:
@@ -627,16 +633,18 @@ MDScreen:
                 text_color: 0.6, 0.9, 0.6, 1
 
             MDScrollView:
-                height: "92dp"
                 size_hint_y: None
+                height: "92dp"
                 do_scroll_x: True
                 do_scroll_y: False
-                bar_width: "4dp"
+                bar_width: "3dp"
                 MDBoxLayout:
                     id: hourly_row
                     orientation: 'horizontal'
                     size_hint_x: None
                     width: self.minimum_width
+                    size_hint_y: None
+                    height: "88dp"
                     spacing: "6dp"
 
             MDLabel:
@@ -649,7 +657,14 @@ MDScreen:
 
             MDList:
                 id: forecast_list
+                size_hint_y: None
+                height: self.minimum_height
                 spacing: "6dp"
+
+            MDBoxLayout:
+                id: bottom_spacer
+                size_hint_y: None
+                height: "0dp"
 """
 
 
@@ -670,7 +685,41 @@ class WildVantage(MDApp):
     def on_start(self):
         if platform == "android":
             self._request_permissions()
+        self._set_safe_areas()
         Clock.schedule_once(self._safe_start, 2)
+
+    def _android_insets(self):
+        """Верхний/нижний системные инсеты в px (status/nav bar).
+
+        На Android читаем реальный RootWindowInsets через pyjnius; если не
+        удалось (например, десктоп) — возвращаем (0, 0).
+        """
+        try:
+            from jnius import autoclass
+
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            activity = PythonActivity.mActivity
+            decor = activity.getWindow().getDecorView()
+            insets = decor.getRootWindowInsets()
+            top = 0
+            bottom = 0
+            if insets is not None:
+                top = int(insets.getSystemWindowInsetTop() or 0)
+                bottom = int(insets.getSystemWindowInsetBottom() or 0)
+            self.log("android insets (px): top=", top, "bottom=", bottom)
+            return top, bottom
+        except Exception:
+            return 0, 0
+
+    def _set_safe_areas(self):
+        """Ставит реальные отступы под status bar / nav bar в scroll-контент."""
+        try:
+            top, bottom = self._android_insets()
+            root = self.root.ids
+            root.header_spacer.height = float(top)
+            root.bottom_spacer.height = float(bottom)
+        except Exception as e:
+            self._log_exc("safe areas", e)
 
     def _request_permissions(self):
         try:
