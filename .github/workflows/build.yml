@@ -85,8 +85,24 @@ jobs:
           restore-keys: buildozer-
 
       - name: Build APK (первый раз идёт ~30 мин)
+        id: build
+        shell: bash
         run: |
-          python -m buildozer android debug
+          set +e
+          python -m buildozer android debug 2>&1 | tee buildozer_run.log
+          rc=${PIPESTATUS[0]}
+          echo "buildozer_rc=$rc"
+          exit $rc
+
+      - name: Upload buildozer log (при сбое сборки)
+        if: failure() && steps.build.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildozer-debug-log
+          path: |
+            buildozer_run.log
+            .buildozer/**/*.log
+          if-no-files-found: warn
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -134,9 +150,15 @@ jobs:
           body: |
             Тестовая сборка WildVantage v${{ env.APK_VERSION }}.
 
-            Изменения в v13.0.1:
-            - фикс краша на старте (MDIcon импортируется из kivymd.uix.label, а не несуществующего kivymd.uix.icon);
-            - защита сетевых/GPS колбэков и стартового чтения кэша от падения процесса.
+            Изменения в v13.0.2:
+            - перестройка вертикальной вёрстки главного экрана: исправлена
+              коренная причина перекрытий (MDCard.adaptive_height в KivyMD 1.1.1 —
+              неактивная заглушка, карточка не вносила свою высоту в адаптивный
+              контейнер);
+            - удалены самоссылочные размеры из texture_size (цикл MDLabel);
+            - отступ под system bars ставится из системных insets (pyjnius);
+            - каждый блок карточки имеет реальную высоту по содержимому;
+            - регрессионный геометрия-тест 118/118 (реальные высоты, 320/360/393/412dp).
           draft: false
           prerelease: true
           files: bin/WILDVANTAGE-v${{ env.APK_VERSION }}.apk
