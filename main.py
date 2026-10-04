@@ -1,5 +1,9 @@
+import http.client
 import json
 import os
+import socket
+import ssl
+import threading
 import time
 import urllib.parse
 from datetime import datetime
@@ -7,7 +11,6 @@ from datetime import datetime
 from kivy.clock import Clock
 from kivy.utils import platform
 from kivy.lang import Builder
-from kivy.network.urlrequest import UrlRequest
 from kivymd.app import MDApp
 from kivymd.uix.list import ThreeLineIconListItem, IconLeftWidget
 from kivymd.uix.boxlayout import MDBoxLayout
@@ -23,6 +26,12 @@ try:
     import certifi
 except Exception:
     certifi = None
+# Графика нужна только для выделения текущего часа (заглушка в тестах без GL).
+try:
+    from kivy.graphics import Color, RoundedRectangle
+except Exception:
+    Color = None
+    RoundedRectangle = None
 
 CACHE_FILE = "wildvantage_v4.json"
 NOMINATIM_UA = "WildVantage (Android weather app; contact: denikhorohenkov2025-hub)"
@@ -54,6 +63,208 @@ REVERSE_URL = (
     "https://nominatim.openstreetmap.org/reverse"
     "?format=jsonv2&lat={lat}&lon={lon}&zoom=18&addressdetails=1&accept-language=ru"
 )
+
+# --- СЕТЬ: классификация ошибок, устойчивость к сломанному IPv6 ---------------
+# Симптом с устройства: «с VPN работает, без VPN — Нет сети». Классическая причина —
+# на мобильной сети без VPN IPv6-маршрут чёрной дырой держит соединение до
+# таймаута, браузер это переживает (Happy Eyeballs), а Python-стек без контроля
+# адреса — нет. Здесь DNS резолвится вручную, IPv4 пробуется ПЕРВЫМ, IPv6
+# остаётся запасным вариантом; каждый адрес получает свой короткий таймаут.
+NET_CONNECT_PER_ADDR = 6.0   # лимит одного адреса, сек (не съедает весь бюджет)
+NET_MAX_ADDR_ATTEMPTS = 4    # сколько адресов пробуем максимум
+PROBE_TARGETS = (
+    ("1.1.1.1", 443),
+    ("8.8.8.8", 443),
+    ("2606:4700:4700::1111", 443),
+    ("api.open-meteo.com", 443),
+    ("nominatim.openstreetmap.org", 443),
+)
+
+
+class NetError(Exception):
+    """Классифицированная сетевая ошибка.
+
+    kind: dns | timeout | connect | tls | http | json | unknown
+    online: None — не проверяли, True/False — результат пробы «есть ли сеть».
+    Секреты (заголовки, тела) в сообщение не попадают.
+    """
+
+    def __init__(self, kind, host="", detail="", status=None):
+        super().__init__(f"net[{kind}] {host} {detail}".strip())
+        self.kind = kind
+        self.host = host
+        self.detail = detail
+        self.status = status
+        self.online = None
+
+
+def net_error_text(err, service="weather"):
+    """Пользовательский текст по классифицированной ошибке (без секретов).
+
+    «Нет интернета» показывается ТОЛЬКО когда проба сети подтвердила офлайн —
+    любая HTTP-ошибка не считается отсутствием интернета.
+    """
+    if getattr(err, "online", None) is False:
+        return "Нет интернета"
+    if getattr(err, "kind", None) == "timeout":
+        return "Сервис не отвечает"
+    if service == "weather":
+        return "Сервис погоды недоступен"
+    if service == "nominatim":
+        return "Не удалось уточнить название места"
+    if service == "geocode":
+        return "Сервис поиска недоступен"
+    return "Сервис не отвечает"
+
+
+def resolve_addrs(host, port=443):
+    """DNS -> адреса подключения, IPv4 ПЕРВЫМИ (см. комментарий выше)."""
+    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    v4, v6, seen = [], [], set()
+    for info in infos:
+        key = info[4][:2]
+        if key in seen:
+            continue
+        seen.add(key)
+        (v4 if info[0] == socket.AF_INET else v6).append(info)
+    addrs = v4 + v6
+    if not addrs:
+        raise socket.gaierror(socket.EAI_NONAME, "no addresses for host")
+    return addrs
+
+
+def _tls_context():
+    """TLS-контекст с обязательной проверкой сертификата (verify=True)."""
+    try:
+        if certifi is not None:
+            return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    return ssl.create_default_context()
+
+
+def _open_connection(addrinfo, server_hostname, timeout, context):
+    """TCP + TLS к конкретному адресу; SNI — исходный хост из URL."""
+    fam, stype, proto, _canon, sa = addrinfo
+    raw = socket.socket(fam, stype, proto)
+    try:
+        raw.settimeout(timeout)
+        raw.connect(sa)
+        if context is not None:
+            return context.wrap_socket(raw, server_hostname=server_hostname)
+        return raw
+    except Exception:
+        raw.close()
+        raise
+
+
+def net_get(url, timeout=12.0, headers=None, resolver=None, opener=None):
+    """GET с раздельной диагностикой: dns / connect / tls / timeout / http.
+
+    resolver(host, port) -> [addrinfo, ...]; opener(addrinfo, host, timeout,
+    context) -> TLS-сокет — подменяются в тестах для имитации сценариев сети.
+    4xx/5xx НЕ ретраятся по адресам: сервер ответил, адреса пробовать незачем.
+    """
+    resolver = resolver or resolve_addrs
+    opener = opener or _open_connection
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    try:
+        addrs = resolver(host, port)
+    except NetError:
+        raise
+    except OSError as e:
+        raise NetError("dns", host, f"{type(e).__name__}: {e}") from e
+    except Exception as e:
+        raise NetError("dns", host, f"{type(e).__name__}: {e}") from e
+
+    use_tls = parts.scheme == "https"
+    context = _tls_context() if use_tls else None
+    conn_cls = http.client.HTTPSConnection if use_tls else http.client.HTTPConnection
+    deadline = time.monotonic() + timeout
+    errors = []
+
+    for addr in addrs[:NET_MAX_ADDR_ATTEMPTS]:
+        ip = str(addr[4][0])
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            raise NetError("timeout", host, "; ".join(errors) or "deadline")
+        per = min(NET_CONNECT_PER_ADDR, remain)
+        try:
+            sock = opener(addr, host, per, context)
+        except ssl.SSLError as e:
+            errors.append(f"tls[{ip}]: {type(e).__name__}: {e}")
+            continue
+        except (socket.timeout, TimeoutError):
+            errors.append(f"timeout[{ip}]")
+            continue
+        except OSError as e:
+            errors.append(f"connect[{ip}]: {type(e).__name__}: errno={getattr(e, 'errno', None)}")
+            continue
+        except Exception as e:
+            errors.append(f"open[{ip}]: {type(e).__name__}: {e}")
+            continue
+        try:
+            conn = conn_cls(host, port, timeout=max(0.5, deadline - time.monotonic()))
+            conn.sock = sock
+            conn.request("GET", path, headers=headers or {})
+            resp = conn.getresponse()
+            status = resp.status
+            body = resp.read(2_000_000)
+            conn.close()
+        except (socket.timeout, TimeoutError) as e:
+            errors.append(f"read-timeout[{ip}]: {e}")
+            try:
+                sock.close()
+            except Exception:
+                pass
+            continue
+        except OSError as e:
+            errors.append(f"io[{ip}]: {type(e).__name__}: {e}")
+            try:
+                sock.close()
+            except Exception:
+                pass
+            continue
+        if 200 <= status < 300:
+            return status, body
+        raise NetError("http", host, f"HTTP {status}", status=status)
+
+    joined = "; ".join(errors)
+    if any(e.startswith(("timeout", "read-timeout")) for e in errors):
+        raise NetError("timeout", host, joined)
+    raise NetError("connect", host, joined)
+
+
+def net_get_json(url, timeout=12.0, headers=None, resolver=None, opener=None):
+    """net_get + разбор JSON. Некорректный JSON -> NetError(kind='json')."""
+    status, body = net_get(url, timeout=timeout, headers=headers,
+                           resolver=resolver, opener=opener)
+    host = urllib.parse.urlsplit(url).hostname or ""
+    try:
+        return status, json.loads(body.decode("utf-8"))
+    except Exception as e:
+        raise NetError("json", host, f"{type(e).__name__}: {e}") from e
+
+
+def probe_online(timeout=1.5, targets=None):
+    """Быстрая проба «есть ли вообще сеть»: TCP до независимых адресов.
+
+    Нужна, чтобы НЕ называть сервис/HTTP-ошибку отсутствием интернета
+    и наоборот — чтобы реальный офлайн показать как «Нет интернета».
+    """
+    for host, port in (targets or PROBE_TARGETS):
+        try:
+            sock = socket.create_connection((host, port), timeout)
+            sock.close()
+            return True
+        except OSError:
+            continue
+    return False
 
 # WMO weather_code -> (описание, иконка днём, иконка ночью)
 WMO = {
@@ -306,6 +517,35 @@ def slice_hours(hours, current_iso, count=24):
     return hours[start:start + count]
 
 
+def slice_hours_from_midnight(hours, current_iso, count=48):
+    """Часы текущего дня начиная с 00:00 + прогноз вперёд (реальные hourly
+    Open-Meteo: прошедшие часы — модельные, они не подписаны как наблюдения)."""
+    if not hours:
+        return []
+    today = None
+    if isinstance(current_iso, str) and len(current_iso) >= 10:
+        today = current_iso[:10]
+    start = 0
+    if today:
+        start = None
+        first_today = None
+        for i, h in enumerate(hours):
+            t = h.get("time")
+            if not isinstance(t, str) or len(t) < 10:
+                continue
+            if t[:10] == today:
+                if first_today is None:
+                    first_today = i
+                if len(t) >= 13 and t[11:13] == "00":
+                    start = i
+                    break
+            elif t[:10] > today:
+                break
+        if start is None:
+            start = first_today if first_today is not None else 0
+    return hours[start:start + count]
+
+
 KV = """
 MDScreen:
     md_bg_color: 0.05, 0.08, 0.05, 1
@@ -430,86 +670,11 @@ MDScreen:
                     theme_text_color: "Custom"
                     text_color: 0.95, 1, 0.95, 1
 
-                # Детали «сейчас»: ощущается | влажность | ветер
+                # Состояние: иконка + описание (сразу после температуры)
                 MDBoxLayout:
                     orientation: 'horizontal'
                     size_hint_y: None
                     height: "24dp"
-                    MDFloatLayout:
-                        size_hint_x: 1
-                        MDBoxLayout:
-                            size_hint: None, None
-                            width: self.minimum_width
-                            height: self.minimum_height
-                            pos_hint: {"center_x": .5, "center_y": .5}
-                            MDIcon:
-                                icon: "thermometer"
-                                font_size: "18sp"
-                                size_hint: None, None
-                                size: "18dp", "18dp"
-                                theme_text_color: "Custom"
-                                text_color: 0.95, 0.85, 0.45, 1
-                            MDLabel:
-                                id: feels_label
-                                text: "--°"
-                                font_size: "15sp"
-                                size_hint: None, None
-                                width: "64dp"
-                                height: "22dp"
-                                theme_text_color: "Custom"
-                                text_color: 0.85, 1, 0.85, 1
-                    MDFloatLayout:
-                        size_hint_x: 1
-                        MDBoxLayout:
-                            size_hint: None, None
-                            width: self.minimum_width
-                            height: self.minimum_height
-                            pos_hint: {"center_x": .5, "center_y": .5}
-                            MDIcon:
-                                icon: "water-percent"
-                                font_size: "18sp"
-                                size_hint: None, None
-                                size: "18dp", "18dp"
-                                theme_text_color: "Custom"
-                                text_color: 0.45, 0.7, 0.95, 1
-                            MDLabel:
-                                id: humidity_label
-                                text: "--%"
-                                font_size: "15sp"
-                                size_hint: None, None
-                                width: "64dp"
-                                height: "22dp"
-                                theme_text_color: "Custom"
-                                text_color: 0.85, 1, 0.85, 1
-                    MDFloatLayout:
-                        size_hint_x: 1
-                        MDBoxLayout:
-                            size_hint: None, None
-                            width: self.minimum_width
-                            height: self.minimum_height
-                            pos_hint: {"center_x": .5, "center_y": .5}
-                            MDIcon:
-                                icon: "weather-windy"
-                                font_size: "18sp"
-                                size_hint: None, None
-                                size: "18dp", "18dp"
-                                theme_text_color: "Custom"
-                                text_color: 0.6, 0.85, 0.6, 1
-                            MDLabel:
-                                id: wind_label
-                                text: "-- м/с"
-                                font_size: "15sp"
-                                size_hint: None, None
-                                width: "80dp"
-                                height: "22dp"
-                                theme_text_color: "Custom"
-                                text_color: 0.85, 1, 0.85, 1
-
-                # Состояние: иконка + описание
-                MDBoxLayout:
-                    orientation: 'horizontal'
-                    size_hint_y: None
-                    height: self.minimum_height
                     MDBoxLayout:
                         size_hint_x: 1
                     MDBoxLayout:
@@ -529,7 +694,7 @@ MDScreen:
                             text: "Загрузка..."
                             font_size: "16sp"
                             size_hint: None, None
-                            width: "235dp"
+                            width: "225dp"
                             height: "24dp"
                             shorten: True
                             text_size: self.width, None
@@ -540,11 +705,143 @@ MDScreen:
                     MDBoxLayout:
                         size_hint_x: 1
 
-                # Восход / закат
+                # Детали «сейчас»: ощущается | влажность | ветер
                 MDBoxLayout:
                     orientation: 'horizontal'
                     size_hint_y: None
-                    height: "24dp"
+                    height: "38dp"
+                    MDFloatLayout:
+                        size_hint_x: 1
+                        MDBoxLayout:
+                            size_hint: None, None
+                            width: self.minimum_width
+                            height: self.minimum_height
+                            pos_hint: {"center_x": .5, "center_y": .5}
+                            MDIcon:
+                                icon: "thermometer"
+                                font_size: "18sp"
+                                size_hint: None, None
+                                size: "18dp", "18dp"
+                                theme_text_color: "Custom"
+                                text_color: 0.95, 0.85, 0.45, 1
+                            MDBoxLayout:
+                                orientation: "vertical"
+                                size_hint: None, None
+                                width: "66dp"
+                                height: self.minimum_height
+                                spacing: "1dp"
+                                MDLabel:
+                                    text: "Ощущается"
+                                    font_size: "10sp"
+                                    halign: "center"
+                                    shorten: True
+                                    size_hint: None, None
+                                    size: "66dp", "13dp"
+                                    text_size: self.width, None
+                                    theme_text_color: "Custom"
+                                    text_color: 0.6, 0.75, 0.6, 1
+                                MDLabel:
+                                    id: feels_label
+                                    text: "--°"
+                                    font_size: "14sp"
+                                    bold: True
+                                    halign: "center"
+                                    shorten: True
+                                    size_hint: None, None
+                                    size: "66dp", "20dp"
+                                    text_size: self.width, None
+                                    theme_text_color: "Custom"
+                                    text_color: 0.85, 1, 0.85, 1
+                    MDFloatLayout:
+                        size_hint_x: 1
+                        MDBoxLayout:
+                            size_hint: None, None
+                            width: self.minimum_width
+                            height: self.minimum_height
+                            pos_hint: {"center_x": .5, "center_y": .5}
+                            MDIcon:
+                                icon: "water-percent"
+                                font_size: "18sp"
+                                size_hint: None, None
+                                size: "18dp", "18dp"
+                                theme_text_color: "Custom"
+                                text_color: 0.45, 0.7, 0.95, 1
+                            MDBoxLayout:
+                                orientation: "vertical"
+                                size_hint: None, None
+                                width: "66dp"
+                                height: self.minimum_height
+                                spacing: "1dp"
+                                MDLabel:
+                                    text: "Влажность"
+                                    font_size: "10sp"
+                                    halign: "center"
+                                    shorten: True
+                                    size_hint: None, None
+                                    size: "66dp", "13dp"
+                                    text_size: self.width, None
+                                    theme_text_color: "Custom"
+                                    text_color: 0.6, 0.75, 0.6, 1
+                                MDLabel:
+                                    id: humidity_label
+                                    text: "--%"
+                                    font_size: "14sp"
+                                    bold: True
+                                    halign: "center"
+                                    shorten: True
+                                    size_hint: None, None
+                                    size: "66dp", "20dp"
+                                    text_size: self.width, None
+                                    theme_text_color: "Custom"
+                                    text_color: 0.85, 1, 0.85, 1
+                    MDFloatLayout:
+                        size_hint_x: 1
+                        MDBoxLayout:
+                            size_hint: None, None
+                            width: self.minimum_width
+                            height: self.minimum_height
+                            pos_hint: {"center_x": .5, "center_y": .5}
+                            MDIcon:
+                                icon: "weather-windy"
+                                font_size: "18sp"
+                                size_hint: None, None
+                                size: "18dp", "18dp"
+                                theme_text_color: "Custom"
+                                text_color: 0.6, 0.85, 0.6, 1
+                            MDBoxLayout:
+                                orientation: "vertical"
+                                size_hint: None, None
+                                width: "66dp"
+                                height: self.minimum_height
+                                spacing: "1dp"
+                                MDLabel:
+                                    text: "Ветер"
+                                    font_size: "10sp"
+                                    halign: "center"
+                                    shorten: True
+                                    size_hint: None, None
+                                    size: "66dp", "13dp"
+                                    text_size: self.width, None
+                                    theme_text_color: "Custom"
+                                    text_color: 0.6, 0.75, 0.6, 1
+                                MDLabel:
+                                    id: wind_label
+                                    text: "-- м/с"
+                                    font_size: "14sp"
+                                    bold: True
+                                    halign: "center"
+                                    shorten: True
+                                    size_hint: None, None
+                                    size: "66dp", "20dp"
+                                    text_size: self.width, None
+                                    theme_text_color: "Custom"
+                                    text_color: 0.85, 1, 0.85, 1
+
+                # Восход / Закат: подпись + время (время в отдельной строке — не разрывается)
+                MDBoxLayout:
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: "38dp"
                     MDFloatLayout:
                         size_hint_x: 1
                         MDBoxLayout:
@@ -556,18 +853,37 @@ MDScreen:
                                 icon: "weather-sunset-up"
                                 font_size: "22sp"
                                 size_hint: None, None
-                                size: "22dp", "22dp"
+                                size: "18dp", "18dp"
                                 theme_text_color: "Custom"
                                 text_color: 0.95, 0.85, 0.45, 1
-                            MDLabel:
-                                id: sunrise_label
-                                text: "--:--"
-                                font_size: "16sp"
+                            MDBoxLayout:
+                                orientation: "vertical"
                                 size_hint: None, None
-                                width: "52dp"
-                                height: "24dp"
-                                theme_text_color: "Custom"
-                                text_color: 0.85, 1, 0.85, 1
+                                width: "66dp"
+                                height: self.minimum_height
+                                spacing: "1dp"
+                                MDLabel:
+                                    text: "Восход"
+                                    font_size: "10sp"
+                                    halign: "center"
+                                    shorten: True
+                                    size_hint: None, None
+                                    size: "66dp", "13dp"
+                                    text_size: self.width, None
+                                    theme_text_color: "Custom"
+                                    text_color: 0.6, 0.75, 0.6, 1
+                                MDLabel:
+                                    id: sunrise_label
+                                    text: "--:--"
+                                    font_size: "14sp"
+                                    bold: True
+                                    halign: "center"
+                                    shorten: True
+                                    size_hint: None, None
+                                    size: "66dp", "20dp"
+                                    text_size: self.width, None
+                                    theme_text_color: "Custom"
+                                    text_color: 0.85, 1, 0.85, 1
                     MDFloatLayout:
                         size_hint_x: 1
                         MDBoxLayout:
@@ -579,26 +895,46 @@ MDScreen:
                                 icon: "weather-sunset-down"
                                 font_size: "22sp"
                                 size_hint: None, None
-                                size: "22dp", "22dp"
+                                size: "18dp", "18dp"
                                 theme_text_color: "Custom"
                                 text_color: 0.95, 0.6, 0.4, 1
-                            MDLabel:
-                                id: sunset_label
-                                text: "--:--"
-                                font_size: "16sp"
+                            MDBoxLayout:
+                                orientation: "vertical"
                                 size_hint: None, None
-                                width: "52dp"
-                                height: "24dp"
-                                theme_text_color: "Custom"
-                                text_color: 0.85, 1, 0.85, 1
+                                width: "66dp"
+                                height: self.minimum_height
+                                spacing: "1dp"
+                                MDLabel:
+                                    text: "Закат"
+                                    font_size: "10sp"
+                                    halign: "center"
+                                    shorten: True
+                                    size_hint: None, None
+                                    size: "66dp", "13dp"
+                                    text_size: self.width, None
+                                    theme_text_color: "Custom"
+                                    text_color: 0.6, 0.75, 0.6, 1
+                                MDLabel:
+                                    id: sunset_label
+                                    text: "--:--"
+                                    font_size: "14sp"
+                                    bold: True
+                                    halign: "center"
+                                    shorten: True
+                                    size_hint: None, None
+                                    size: "66dp", "20dp"
+                                    text_size: self.width, None
+                                    theme_text_color: "Custom"
+                                    text_color: 0.85, 1, 0.85, 1
 
                 # Статус обновления
                 MDLabel:
                     id: status_label
-                    text: "Система готова"
+                    text: "Обновлено: --:--"
                     halign: "center"
                     valign: "middle"
                     font_size: "13sp"
+                    shorten: True
                     size_hint_y: None
                     height: "20dp"
                     text_size: self.width, None
@@ -623,9 +959,10 @@ MDScreen:
                     MDBoxLayout:
                         size_hint_x: 1
 
-            # Ближайшие 24 ч — горизонтальный скролл
+            # Почасовая погода — лента с 00:00 текущего дня
             MDLabel:
-                text: "БЛИЖАЙШИЕ 24 Ч"
+                id: hourly_label
+                text: "ПОЧАСОВАЯ ПОГОДА"
                 bold: True
                 size_hint_y: None
                 height: "20dp"
@@ -633,6 +970,7 @@ MDScreen:
                 text_color: 0.6, 0.9, 0.6, 1
 
             MDScrollView:
+                id: hourly_scroll
                 size_hint_y: None
                 height: "92dp"
                 do_scroll_x: True
@@ -679,6 +1017,7 @@ class WildVantage(MDApp):
         self._last_weather = None
         self._last_coords = None
         self._loc_name = ""
+        self._loc_name_coords = ""    # ключ координат владельца текущего названия
         self._reset_gps_state()
         return Builder.load_string(KV)
 
@@ -686,6 +1025,7 @@ class WildVantage(MDApp):
         if platform == "android":
             self._request_permissions()
         self._set_safe_areas()
+        self._start_gen = self._gen
         Clock.schedule_once(self._safe_start, 2)
 
     def _android_insets(self):
@@ -746,8 +1086,12 @@ class WildVantage(MDApp):
             except Exception:
                 pass
         # Ошибка обработки кэша не должна закрывать приложение на старте (~2 с).
+        # Кэш НЕ подменяет свежие данные: если за 2 с уже пришёл (или идёт)
+        # живой запрос — не трогаем показ.
         try:
-            self.load_cache()
+            start_gen = getattr(self, "_start_gen", None)
+            if self._last_weather is None and (start_gen is None or start_gen == self._gen):
+                self.load_cache(gen=start_gen)
         except Exception as e:
             self._log_exc("load_cache", e)
             self._set_status("Кэш не читается — включите интернет")
@@ -807,53 +1151,80 @@ class WildVantage(MDApp):
         except Exception:
             pass
 
+    def _name_matches_coords(self, lat, lon):
+        """Текущее название принадлежит ИМЕННО этим координатам?"""
+        return bool(getattr(self, "_loc_name", "")) and (
+            getattr(self, "_loc_name_coords", "") == f"{lat:.5f}, {lon:.5f}"
+        )
+
+    def _set_name_coords_key(self, lat, lon):
+        self._loc_name_coords = f"{lat:.5f}, {lon:.5f}"
+
     # --- АСИНХРОННЫЙ HTTP (Kivy на Android) ---
-    def _fetch(self, url, on_success=None, on_error=None, timeout=None, headers=None):
-        kwargs = {}
-        if certifi is not None:
-            kwargs["ca_file"] = certifi.where()
-        req = [None]
-        state = {"done": False}
+    def _fetch(self, url, on_success=None, on_error=None, timeout=None, headers=None,
+               resolver=None, opener=None):
+        """GET в фоновом потоке (сетевой код не блокирует UI), результат
+        доставляется в главный поток через Clock.schedule_once.
 
-        def wrap(cb):
-            def wrapped(*a):
-                if state["done"]:
+        Ошибка колбэку — всегда NetError: kind (dns/timeout/connect/tls/http/
+        json), host (только hostname, без секретов), online — результат пробы
+        сети (None, если проба не требовалась). Каждый колбэк вызывается ровно
+        один раз.
+        """
+
+        def deliver_success(payload):
+            def _go(_dt):
+                if on_success is None:
                     return
-                state["done"] = True
                 try:
-                    cb(*a)
+                    on_success(None, payload)
                 except Exception as e:
-                    # Ошибка в сетевом колбэке не должна ронять процесс:
-                    # логируем полный traceback и продолжаем работать.
                     self._log_exc("network callback", e)
-            return wrapped
+            Clock.schedule_once(_go)
 
-        def abort(_dt):
-            if not state["done"]:
-                state["done"] = True
-                if req[0] is not None:
-                    try:
-                        req[0].cancel()
-                    except Exception:
-                        pass
-                if on_error:
-                    on_error(None, Exception("timeout"))
+        def deliver_error(err):
+            def _go(_dt):
+                if on_error is None:
+                    return
+                try:
+                    on_error(None, err)
+                except Exception as e:
+                    self._log_exc("network callback", e)
+            Clock.schedule_once(_go)
 
-        if timeout is not None:
-            Clock.schedule_once(abort, timeout)
-        try:
-            req[0] = UrlRequest(
-                url,
-                on_success=wrap(on_success) if on_success else None,
-                on_failure=wrap(on_error) if on_error else None,
-                on_error=wrap(on_error) if on_error else None,
-                verify=True,
-                req_headers=headers,
-                **kwargs,
-            )
-        except Exception:
-            if on_error:
-                on_error(None, Exception("http init"))
+        def worker():
+            host = urllib.parse.urlsplit(url).hostname or ""
+            try:
+                status, body = net_get(
+                    url,
+                    timeout=float(timeout) if timeout else 12.0,
+                    headers=headers,
+                    resolver=resolver,
+                    opener=opener,
+                )
+            except NetError as e:
+                if e.kind in ("http", "json"):
+                    # Сервис ответил — интернет есть, проба не нужна.
+                    e.online = True
+                else:
+                    e.online = probe_online()
+                deliver_error(e)
+                return
+            except Exception as e:
+                err = NetError("unknown", host, f"{type(e).__name__}: {e}")
+                err.online = probe_online()
+                deliver_error(err)
+                return
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except Exception as e:
+                err = NetError("json", host, f"{type(e).__name__}: {e}")
+                err.online = True
+                deliver_error(err)
+                return
+            deliver_success(payload)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # --- ПОИСК ГОРОДА ---
     def search_logic(self):
@@ -887,8 +1258,9 @@ class WildVantage(MDApp):
         self.log("geocode:", name, lat, lon)
         self.start_update(lat, lon, source="search", display_name=name, timeout=15)
 
-    def on_geocode_error(self, *args):
-        self._set_status("Город не найден (нет сети)")
+    def on_geocode_error(self, _req, err):
+        self.log("geocode error:", err)
+        self._set_status(net_error_text(err, "geocode"))
 
     # --- GPS: сбор нескольких fixes, выбор лучшего по accuracy ---
     def _reset_gps_state(self):
@@ -1104,12 +1476,16 @@ class WildVantage(MDApp):
 
         if display_name:
             self._set_location_name(display_name)
+            self._set_name_coords_key(lat, lon)
         else:
-            self._set_location_name(None)
-            try:
-                self.root.ids.loc_label.text = "Определяю место..."
-            except Exception:
-                pass
+            if not self._name_matches_coords(lat, lon):
+                self._set_location_name(None)
+                try:
+                    self.root.ids.loc_label.text = "Определяю место..."
+                except Exception:
+                    pass
+            # Те же координаты — прежнее название остаётся на экране, пока
+            # Nominatim не уточнит его заново (защита «название пропало»).
             self.reverse_geocode(lat, lon, gen)
 
         self._set_status("Загрузка погоды...")
@@ -1140,14 +1516,25 @@ class WildVantage(MDApp):
             self.log("geocode: selected location name =", name)
             if name:
                 self._set_location_name(name)
+                self._set_name_coords_key(lat, lon)
                 self._save_cache()
             else:
                 self._set_location_name(f"{lat:.5f}, {lon:.5f}")
+                self._set_name_coords_key(lat, lon, "coords")
 
-        def error(_req, _err):
-            self.log("geocode: nominatim error:", _err)
-            if gen == self._gen:
+        def error(_req, err):
+            self.log("geocode: nominatim error:", err)
+            if gen != self._gen:
+                return
+            # Название уже известно ДЛЯ ЭТИХ ЖЕ координат — не подменяем его
+            # координатной строкой (баг «Косино пропало» при ошибке сети).
+            if not self._name_matches_coords(lat, lon):
                 self._set_location_name(f"{lat:.5f}, {lon:.5f}")
+                self._set_name_coords_key(lat, lon)
+            # Статус ошибки названия — только пока погода ещё не пришла:
+            # свежие данные не затираются сообщением о геокодере.
+            if self._last_weather is None:
+                self._set_status(net_error_text(err, "nominatim"))
 
         self._fetch(url, on_success=success, on_error=error, timeout=12, headers=headers)
 
@@ -1162,7 +1549,12 @@ class WildVantage(MDApp):
             weather = normalize_weather(result)
             if not weather or not weather.get("daily"):
                 self.log("weather: пустой ответ")
-                self.load_cache(gen=gen, show_err=True, requested=self._last_coords)
+                self.load_cache(
+                    gen=gen,
+                    show_err=True,
+                    requested=self._last_coords,
+                    status_msg="Сервис погоды недоступен",
+                )
                 return
             self._last_weather = weather
             self.log("weather: источник = Open-Meteo (API)")
@@ -1187,7 +1579,12 @@ class WildVantage(MDApp):
             if gen != self._gen:
                 return
             self.log("weather error:", err)
-            self.load_cache(gen=gen, show_err=True, requested=self._last_coords)
+            self.load_cache(
+                gen=gen,
+                show_err=True,
+                requested=self._last_coords,
+                status_msg=net_error_text(err, "weather"),
+            )
 
         self._fetch(url, on_success=success, on_error=error, timeout=timeout)
 
@@ -1223,7 +1620,10 @@ class WildVantage(MDApp):
         except Exception:
             pass
 
-        self._fill_hours(slice_hours(weather.get("hours") or [], cur.get("time")))
+        self._fill_hours(
+            slice_hours_from_midnight(weather.get("hours") or [], cur.get("time")),
+            cur.get("time"),
+        )
 
         if days:
             today = days[0]
@@ -1235,25 +1635,62 @@ class WildVantage(MDApp):
                 pass
             self._fill_forecast(days[:7])
 
-        if from_cache:
-            self._set_status("⚠️ Нет сети. Данные из кэша.")
-        else:
+        if not from_cache:
+            # Для кэша финальный статус формирует load_cache (с причиной).
             self._set_status(updated_status_text(cur.get("time")))
 
-    def _fill_hours(self, hours):
-        """Строит почасовые ячейки «Ближайшие 24 ч» (иконка, время, °)."""
+    def _fill_hours(self, hours, current_time=None):
+        """Строит ленту «ПОЧАСОВАЯ ПОГОДА» с 00:00 текущего дня.
+
+        Текущий час подсвечен и подписан «Сейчас», прошедшие приглушены;
+        после отрисовки лента прокручивается к текущему часу.
+        """
         try:
             row = self.root.ids.hourly_row
         except Exception:
             return
         row.clear_widgets()
-        for h in hours:
+        current_idx = -1
+        for i, h in enumerate(hours):
             try:
-                self._build_hour_cell(row, h)
+                if self._build_hour_cell(row, h, current_time):
+                    current_idx = i
             except Exception as e:
                 self._log_exc("hour cell", e)
+        self._scroll_hourly_to_now(current_idx)
 
-    def _build_hour_cell(self, row, h):
+    def _scroll_hourly_to_now(self, current_idx):
+        """Прокрутка ленты так, чтобы текущий час был по центру видимой части."""
+        if current_idx is None or current_idx < 0:
+            return
+
+        def _do(_dt):
+            try:
+                scroll = self.root.ids.hourly_scroll
+                row = self.root.ids.hourly_row
+                cell_step = 52 + 6
+                content_w = row.width
+                view_w = scroll.width
+                max_scroll = content_w - view_w
+                if max_scroll <= 0:
+                    return
+                desired = current_idx * cell_step + 26 - view_w / 2.0
+                scroll.scroll_x = max(0.0, min(1.0, desired / max_scroll))
+            except Exception as e:
+                self._log_exc("hourly auto-scroll", e)
+
+        Clock.schedule_once(_do, 0)
+
+    def _build_hour_cell(self, row, h, current_time=None):
+        time_iso = str(h.get("time") or "")
+        now_iso = str(current_time or "")
+        is_current = bool(now_iso) and len(time_iso) >= 13 and time_iso[:13] == now_iso[:13]
+        is_past = bool(now_iso) and len(time_iso) >= 13 and len(now_iso) >= 13 and time_iso[:13] < now_iso[:13]
+        if is_current:
+            past = False
+        else:
+            past = is_past
+
         is_day = True
         try:
             is_day = bool(int(h.get("is_day", 1)))
@@ -1266,16 +1703,41 @@ class WildVantage(MDApp):
             size_hint=(None, None),
             size=("52dp", "88dp"),
         )
+        if is_current and Color is not None and RoundedRectangle is not None:
+            # Подсветка текущего часа: скруглённая подложка (canvas, не pos_hint)
+            try:
+                with box.canvas.before:
+                    Color(0.16, 0.30, 0.16, 1)
+                    rect = RoundedRectangle(radius=[(6, 6, 6, 6)])
+                    rect.pos = box.pos
+                    rect.size = box.size
+                box.bind(
+                    pos=lambda inst, p: setattr(rect, "pos", p),
+                    size=lambda inst, s: setattr(rect, "size", s),
+                )
+            except Exception as e:
+                self._log_exc("hour highlight", e)
+
+        if past:
+            time_color = (0.5, 0.58, 0.5, 1)
+            icon_color = (0.55, 0.6, 0.55, 1)
+            temp_color = (0.6, 0.65, 0.6, 1)
+        else:
+            time_color = (0.7, 0.85, 0.7, 1)
+            icon_color = (0.85, 1, 0.85, 1)
+            temp_color = (0.95, 1, 0.95, 1)
+
         box.add_widget(
             MDLabel(
-                text=fmt_hhmm(h.get("time")),
+                text="Сейчас" if is_current else fmt_hhmm(h.get("time")),
                 font_size="12sp",
+                bold=is_current,
                 halign="center",
                 size_hint=(None, None),
                 size=("52dp", "18dp"),
                 text_size=(None, None),
                 theme_text_color="Custom",
-                text_color=(0.7, 0.85, 0.7, 1),
+                text_color=time_color,
             )
         )
         box.add_widget(
@@ -1284,7 +1746,7 @@ class WildVantage(MDApp):
                 font_size="22sp",
                 halign="center",
                 theme_text_color="Custom",
-                text_color=(0.85, 1, 0.85, 1),
+                text_color=icon_color,
                 size_hint=(None, None),
                 size=("52dp", "28dp"),
             )
@@ -1299,10 +1761,11 @@ class WildVantage(MDApp):
                 size=("52dp", "20dp"),
                 text_size=(None, None),
                 theme_text_color="Custom",
-                text_color=(0.95, 1, 0.95, 1),
+                text_color=temp_color,
             )
         )
         row.add_widget(box)
+        return is_current
 
     def _fill_forecast(self, days):
         try:
@@ -1355,27 +1818,41 @@ class WildVantage(MDApp):
         except Exception:
             pass
 
-    def load_cache(self, gen=None, city_filter=None, show_err=False, requested=None):
+    def load_cache(self, gen=None, city_filter=None, show_err=False,
+                   requested=None, status_msg=None):
+        """Показать кэш. Статус всегда составляется здесь: причина (status_msg)
+        + пометка, что данные из кэша. Свежий API приоритетнее кэша (gen-guard).
+        Возвращает True, если данные кэша показаны.
+        """
         if gen is not None and gen != self._gen:
-            return
+            return False
+
+        def fail(text):
+            try:
+                self._set_status(text)
+            except Exception:
+                pass
+            return False
+
         try:
             with open(self.cache_file, "r", encoding="utf-8") as f:
                 record = json.load(f)
         except Exception:
-            self._set_status("Кэш пуст — включите интернет")
-            return
+            if status_msg:
+                return fail(f"{status_msg}. Нет данных.")
+            return fail("Кэш пуст — включите интернет")
 
         if city_filter:
             name = record.get("location_name") or ""
             if city_filter.lower() not in name.lower():
-                self._set_status("Город не найден в кэше")
-                return
+                return fail("Город не найден в кэше")
 
         weather = record.get("weather")
         coords = record.get("coords") if isinstance(record.get("coords"), dict) else {}
         if not isinstance(weather, dict) or not weather.get("daily"):
-            self._set_status("Кэш повреждён — включите интернет")
-            return
+            if status_msg:
+                return fail(f"{status_msg}. Нет данных.")
+            return fail("Кэш повреждён — включите интернет")
 
         is_far = bool(requested) and self._coords_far(requested, coords)
         if is_far:
@@ -1387,17 +1864,28 @@ class WildVantage(MDApp):
         self._last_coords = coords
         if is_far:
             self._set_location_name(f"{coords.get('lat', 0):.5f}, {coords.get('lon', 0):.5f}")
+            self._loc_name_coords = f"{coords.get('lat', 0):.5f}, {coords.get('lon', 0):.5f}"
         else:
             self._set_location_name(record.get("location_name") or "Кэш")
+            self._loc_name_coords = f"{coords.get('lat', 0):.5f}, {coords.get('lon', 0):.5f}"
         self.process_weather(weather, coords, from_cache=True)
 
-        if show_err:
+        if status_msg:
             if is_far:
-                self._set_status("⚠️ Нет сети. Кэш от другого места.")
+                self._set_status(f"{status_msg}. Данные из кэша (другое место).")
             else:
-                self._set_status("⚠️ Нет сети. Данные из кэша.")
+                self._set_status(f"{status_msg}. Данные из кэша.")
+            return True
+        if is_far:
+            self._set_status("Данные из кэша (другое место)")
+        elif show_err:
+            self._set_status("Данные из кэша")
         elif city_filter:
             self._set_status("Офлайн: данные из кэша")
+        else:
+            saved = record.get("saved_at")
+            self._set_status(f"Данные из кэша ({saved})" if saved else "Данные из кэша")
+        return True
 
     def _coords_far(self, a, b):
         try:

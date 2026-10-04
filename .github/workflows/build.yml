@@ -153,6 +153,32 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Release notes
+        shell: bash
+        run: |
+          cat > release_notes.md <<'EOF'
+          Тестовая сборка WildVantage v13.0.2.
+
+          Изменения в v13.0.2:
+          - перестройка вертикальной вёрстки главного экрана: исправлена коренная
+            причина перекрытий (MDCard.adaptive_height в KivyMD 1.1.1 — неактивная
+            заглушка, карточка не вносила высоту в адаптивный контейнер);
+          - новый устойчивый сетевой слой: IPv4-первые адреса и лимит на адрес
+            (фикс «с VPN работает, без VPN — Нет сети»), классификация ошибок
+            (dns/timeout/connect/tls/http/json), проба наличия сети —
+            «Нет интернета» показывается только при реальном офлайне;
+          - карточка с подписями: Ощущается | Влажность | Ветер, Восход | Закат —
+            время и статус больше не разрываются на переносы;
+          - почасовая погода: лента с 00:00 текущего дня (48 ч), текущий час
+            «Сейчас» с подсветкой, прошедшие часы приглушены, автоскролл;
+          - Nominatim и Open-Meteo развязаны: сбой одного не теряет данные
+            другого, название места не пропадает при ошибке сети для тех же
+            координат;
+          - кэш и generation-guard: свежий API всегда приоритетнее кэша, стартовая
+            загрузка не подменяет живой запрос;
+          - тесты: 601 проверка (геометрия 320/360/393/412dp, сеть, почасовая, UI).
+          EOF
+
       - name: Create test prerelease v${{ env.APK_VERSION }}-test
         if: success() && env.EXISTS == '0'
         uses: softprops/action-gh-release@v2
@@ -161,19 +187,19 @@ jobs:
         with:
           tag_name: v${{ env.APK_VERSION }}-test
           name: WildVantage v${{ env.APK_VERSION }} (тестовый prerelease)
-          body: |
-            Тестовая сборка WildVantage v${{ env.APK_VERSION }}.
-
-            Изменения в v13.0.2:
-            - перестройка вертикальной вёрстки главного экрана: исправлена
-              коренная причина перекрытий (MDCard.adaptive_height в KivyMD 1.1.1 —
-              неактивная заглушка, карточка не вносила свою высоту в адаптивный
-              контейнер);
-            - удалены самоссылочные размеры из texture_size (цикл MDLabel);
-            - отступ под system bars ставится из системных insets (pyjnius);
-            - каждый блок карточки имеет реальную высоту по содержимому;
-            - регрессионный геометрия-тест 118/118 (реальные высоты, 320/360/393/412dp).
+          body_path: release_notes.md
           draft: false
           prerelease: true
           files: bin/WILDVANTAGE-v${{ env.APK_VERSION }}.apk
           fail_on_unmatched_files: true
+
+      - name: Update existing test release (replace APK + notes)
+        if: success() && env.EXISTS == '1'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          gh release delete-asset "v${APK_VERSION}-test" "WILDVANTAGE-v${APK_VERSION}.apk" --yes || true
+          gh release upload "v${APK_VERSION}-test" "bin/WILDVANTAGE-v${APK_VERSION}.apk"
+          gh release edit "v${APK_VERSION}-test" --notes-file release_notes.md --prerelease
