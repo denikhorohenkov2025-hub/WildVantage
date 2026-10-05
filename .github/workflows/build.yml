@@ -5,8 +5,9 @@ on:
   push:
     branches: [main, master]
 
+# Сборка ТОЛЬКО в artifact; публикация релизов/prerelease/tag запрещена.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -118,88 +119,25 @@ jobs:
           print("::error title=buildozer-log-tail::" + msg)
           PYEOF
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: wildvantage-apk
-          path: bin/*.apk
-          if-no-files-found: error
-
       - name: Determine version from buildozer.spec
         id: ver
         run: |
           ver=$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' buildozer.spec | head -1 | tr -d ' \r')
           echo "APK_VERSION=$ver" >> "$GITHUB_ENV"
-          echo "TAG=v${ver}-test" >> "$GITHUB_ENV"
           echo "version=$ver"
 
-      - name: Prepare release APK (arm64-v8a by preference)
+      - name: Prepare test APK (arm64-v8a by preference)
         run: |
           src=$(ls bin/*arm64* 2>/dev/null | head -1)
           if [ -z "$src" ]; then src=$(ls bin/*.apk 2>/dev/null | head -1); fi
           echo "source=$src"
           cp "$src" "bin/WILDVANTAGE-v${APK_VERSION}.apk"
+          sha256sum "bin/WILDVANTAGE-v${APK_VERSION}.apk"
           ls -la bin/
 
-      - name: Check if test release already exists
-        id: chk
-        run: |
-          code=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG}")
-          echo "api_status=$code"
-          if [ "$code" = "200" ]; then echo "EXISTS=1" >> "$GITHUB_ENV"; else echo "EXISTS=0" >> "$GITHUB_ENV"; fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Release notes
-        shell: bash
-        run: |
-          cat > release_notes.md <<'EOF'
-          Тестовая сборка WildVantage v13.0.2.
-
-          Изменения в v13.0.2:
-          - перестройка вертикальной вёрстки главного экрана: исправлена коренная
-            причина перекрытий (MDCard.adaptive_height в KivyMD 1.1.1 — неактивная
-            заглушка, карточка не вносила высоту в адаптивный контейнер);
-          - новый устойчивый сетевой слой: IPv4-первые адреса и лимит на адрес
-            (фикс «с VPN работает, без VPN — Нет сети»), классификация ошибок
-            (dns/timeout/connect/tls/http/json), проба наличия сети —
-            «Нет интернета» показывается только при реальном офлайне;
-          - карточка с подписями: Ощущается | Влажность | Ветер, Восход | Закат —
-            время и статус больше не разрываются на переносы;
-          - почасовая погода: лента с 00:00 текущего дня (48 ч), текущий час
-            «Сейчас» с подсветкой, прошедшие часы приглушены, автоскролл;
-          - Nominatim и Open-Meteo развязаны: сбой одного не теряет данные
-            другого, название места не пропадает при ошибке сети для тех же
-            координат;
-          - кэш и generation-guard: свежий API всегда приоритетнее кэша, стартовая
-            загрузка не подменяет живой запрос;
-          - тесты: 601 проверка (геометрия 320/360/393/412dp, сеть, почасовая, UI).
-          EOF
-
-      - name: Create test prerelease v${{ env.APK_VERSION }}-test
-        if: success() && env.EXISTS == '0'
-        uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload APK artifact (без публикации релизов)
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: v${{ env.APK_VERSION }}-test
-          name: WildVantage v${{ env.APK_VERSION }} (тестовый prerelease)
-          body_path: release_notes.md
-          draft: false
-          prerelease: true
-          files: bin/WILDVANTAGE-v${{ env.APK_VERSION }}.apk
-          fail_on_unmatched_files: true
-
-      - name: Update existing test release (replace APK + notes)
-        if: success() && env.EXISTS == '1'
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -e
-          gh release delete-asset "v${APK_VERSION}-test" "WILDVANTAGE-v${APK_VERSION}.apk" --yes || true
-          gh release upload "v${APK_VERSION}-test" "bin/WILDVANTAGE-v${APK_VERSION}.apk"
-          gh release edit "v${APK_VERSION}-test" --notes-file release_notes.md --prerelease
+          name: wildvantage-apk-${{ env.APK_VERSION }}
+          path: bin/*.apk
+          if-no-files-found: error

@@ -11,7 +11,7 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,json
 
 # Можно поднять при релизе
-version = 13.0.2
+version = 13.0.3
 
 requirements = python3,kivy==2.2.1,kivymd==1.1.1,plyer,pillow,urllib3,certifi
 
@@ -35,11 +35,25 @@ android.accept_sdk_license = True
 
 android.enable_androidx = True
 
+# Фоновое обновление погоды (~15 мин): WorkManager (unique periodic work)
+# ставит задачу при наличии сети; Java-воркер сам берёт координаты из кэша,
+# запрос Open-Meteo и атомарно пишет сырой ответ рядом с кэшем — Python
+# принимает его при открытии/раз в 60 секунд. Без foreground-сервиса и
+# уведомлений. Периодичность приблизительная (Doze откладывает до окон
+# активности) — это штатное поведение системы.
+android.gradle_dependencies = androidx.work:work-runtime:2.7.1
+
+android.add_gradle_repositories = mavenCentral()
+
+# Java-исходники воркера и планировщика (компилируются вместе с проектом).
+android.add_src = src/java
+
 android.logcat_filters =
     *:S
     Python:V
     pyjnius:V
     plyer:V
+    WildVantage:V
 
 [buildozer]
 

@@ -6,11 +6,12 @@ import ssl
 import threading
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from kivy.clock import Clock
 from kivy.utils import platform
 from kivy.lang import Builder
+from kivy.metrics import dp
 from kivymd.app import MDApp
 from kivymd.uix.list import ThreeLineIconListItem, IconLeftWidget
 from kivymd.uix.boxlayout import MDBoxLayout
@@ -34,6 +35,9 @@ except Exception:
     RoundedRectangle = None
 
 CACHE_FILE = "wildvantage_v4.json"
+# Сырой ответ Open-Meteo, который атомарно пишет фоновый Java-воркер
+# (WorkManager) рядом с кэшем; Python принимает его в consume_bg_raw.
+BG_RAW_FILE = "wildvantage_bg_raw.json"
 NOMINATIM_UA = "WildVantage (Android weather app; contact: denikhorohenkov2025-hub)"
 
 # Сбор GPS: ищем лучший fix, не берём первый грубый.
@@ -163,7 +167,9 @@ def net_get(url, timeout=12.0, headers=None, resolver=None, opener=None):
 
     resolver(host, port) -> [addrinfo, ...]; opener(addrinfo, host, timeout,
     context) -> TLS-сокет — подменяются в тестах для имитации сценариев сети.
-    4xx/5xx НЕ ретраятся по адресам: сервер ответил, адреса пробовать незачем.
+    4xx/5xx НЕ ретраятся: сервер ответил, адреса пробовать незачем.
+    До 2 проходов по адресам (ограниченный retry со свежим DNS), общий
+    бюджет timeout на оба прохода — бесконечных циклов нет.
     """
     resolver = resolver or resolve_addrs
     opener = opener or _open_connection
@@ -173,14 +179,6 @@ def net_get(url, timeout=12.0, headers=None, resolver=None, opener=None):
     path = parts.path or "/"
     if parts.query:
         path += "?" + parts.query
-    try:
-        addrs = resolver(host, port)
-    except NetError:
-        raise
-    except OSError as e:
-        raise NetError("dns", host, f"{type(e).__name__}: {e}") from e
-    except Exception as e:
-        raise NetError("dns", host, f"{type(e).__name__}: {e}") from e
 
     use_tls = parts.scheme == "https"
     context = _tls_context() if use_tls else None
@@ -188,51 +186,67 @@ def net_get(url, timeout=12.0, headers=None, resolver=None, opener=None):
     deadline = time.monotonic() + timeout
     errors = []
 
-    for addr in addrs[:NET_MAX_ADDR_ATTEMPTS]:
-        ip = str(addr[4][0])
-        remain = deadline - time.monotonic()
-        if remain <= 0:
-            raise NetError("timeout", host, "; ".join(errors) or "deadline")
-        per = min(NET_CONNECT_PER_ADDR, remain)
+    for pass_no in range(2):
         try:
-            sock = opener(addr, host, per, context)
-        except ssl.SSLError as e:
-            errors.append(f"tls[{ip}]: {type(e).__name__}: {e}")
-            continue
-        except (socket.timeout, TimeoutError):
-            errors.append(f"timeout[{ip}]")
-            continue
+            addrs = resolver(host, port)
+        except NetError:
+            raise
         except OSError as e:
-            errors.append(f"connect[{ip}]: {type(e).__name__}: errno={getattr(e, 'errno', None)}")
-            continue
+            raise NetError("dns", host, f"{type(e).__name__}: {e}") from e
         except Exception as e:
-            errors.append(f"open[{ip}]: {type(e).__name__}: {e}")
-            continue
-        try:
-            conn = conn_cls(host, port, timeout=max(0.5, deadline - time.monotonic()))
-            conn.sock = sock
-            conn.request("GET", path, headers=headers or {})
-            resp = conn.getresponse()
-            status = resp.status
-            body = resp.read(2_000_000)
-            conn.close()
-        except (socket.timeout, TimeoutError) as e:
-            errors.append(f"read-timeout[{ip}]: {e}")
+            raise NetError("dns", host, f"{type(e).__name__}: {e}") from e
+
+        for addr in addrs[:NET_MAX_ADDR_ATTEMPTS]:
+            ip = str(addr[4][0])
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                raise NetError("timeout", host, "; ".join(errors) or "deadline")
+            per = min(NET_CONNECT_PER_ADDR, remain)
             try:
-                sock.close()
-            except Exception:
-                pass
-            continue
-        except OSError as e:
-            errors.append(f"io[{ip}]: {type(e).__name__}: {e}")
+                sock = opener(addr, host, per, context)
+            except ssl.SSLError as e:
+                errors.append(f"tls[{ip}]: {type(e).__name__}: {e}")
+                continue
+            except (socket.timeout, TimeoutError):
+                errors.append(f"timeout[{ip}]")
+                continue
+            except OSError as e:
+                errors.append(f"connect[{ip}]: {type(e).__name__}: errno={getattr(e, 'errno', None)}")
+                continue
+            except Exception as e:
+                errors.append(f"open[{ip}]: {type(e).__name__}: {e}")
+                continue
             try:
-                sock.close()
-            except Exception:
-                pass
+                conn = conn_cls(host, port, timeout=max(0.5, deadline - time.monotonic()))
+                conn.sock = sock
+                conn.request("GET", path, headers=headers or {})
+                resp = conn.getresponse()
+                status = resp.status
+                body = resp.read(2_000_000)
+                conn.close()
+            except (socket.timeout, TimeoutError) as e:
+                errors.append(f"read-timeout[{ip}]: {e}")
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                continue
+            except OSError as e:
+                errors.append(f"io[{ip}]: {type(e).__name__}: {e}")
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                continue
+            if 200 <= status < 300:
+                return status, body
+            raise NetError("http", host, f"HTTP {status}", status=status)
+
+        # Проход не удался. Второй (последний) — только если есть бюджет.
+        if pass_no == 0 and errors and deadline - time.monotonic() > 0.5:
+            errors.append("retry-pass")
             continue
-        if 200 <= status < 300:
-            return status, body
-        raise NetError("http", host, f"HTTP {status}", status=status)
+        break
 
     joined = "; ".join(errors)
     if any(e.startswith(("timeout", "read-timeout")) for e in errors):
@@ -251,15 +265,23 @@ def net_get_json(url, timeout=12.0, headers=None, resolver=None, opener=None):
         raise NetError("json", host, f"{type(e).__name__}: {e}") from e
 
 
-def probe_online(timeout=1.5, targets=None):
+def probe_online(timeout=1.5, targets=None, total=None):
     """Быстрая проба «есть ли вообще сеть»: TCP до независимых адресов.
 
     Нужна, чтобы НЕ называть сервис/HTTP-ошибку отсутствием интернета
     и наоборот — чтобы реальный офлайн показать как «Нет интернета».
+
+    Общий бюджет total (по умолчанию max(timeout, 2.5) с) ограничивает
+    суммарное время всех целей: даже при мёртвых адресах проба не
+    «зависает» на десятки секунд и не блокирует статус.
     """
+    deadline = time.monotonic() + (float(total) if total else max(timeout, 2.5))
     for host, port in (targets or PROBE_TARGETS):
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            return False
         try:
-            sock = socket.create_connection((host, port), timeout)
+            sock = socket.create_connection((host, port), min(timeout, remain))
             sock.close()
             return True
         except OSError:
@@ -477,9 +499,255 @@ def fmt_hhmm(iso):
     return "--:--"
 
 
-def updated_status_text(iso):
-    """Компактная строка статуса. Timezone в UI НЕ показываем."""
-    return f"Обновлено: {fmt_hhmm(iso)}"
+def hhmm_from_unix(unix, offset=0):
+    """HH:MM в timezone места (offset — utc_offset_seconds из ответа API)."""
+    try:
+        moment = datetime.fromtimestamp(int(unix), tz=timezone.utc)
+        moment = moment + timedelta(seconds=int(offset or 0))
+        return moment.strftime("%H:%M")
+    except Exception:
+        return "--:--"
+
+
+def updated_status_text(last_success=None, fallback_iso=None):
+    """«Обновлено: HH:MM» только от последнего УСПЕШНОГО обновления.
+
+    last_success: {"unix": int, "offset": int} — момент успеха fetch в unix и
+    сдвиг timezone места. fallback_iso — время данных старого кэша (формат
+    Open-Meteo, уже в timezone места). Ошибка время НЕ меняет: сюда оно не
+    передаётся вовсе.
+    """
+    if isinstance(last_success, str) and not isinstance(fallback_iso, str):
+        # Совместимость старого вызова updated_status_text(iso): строка — это
+        # время данных (fallback), а не момент успеха.
+        last_success, fallback_iso = None, last_success
+    if isinstance(last_success, dict) and last_success.get("unix") is not None:
+        return f"Обновлено: {hhmm_from_unix(last_success.get('unix'), last_success.get('offset'))}"
+    if isinstance(fallback_iso, str) and len(fallback_iso) >= 16 and "T" in fallback_iso:
+        return f"Обновлено: {fmt_hhmm(fallback_iso)}"
+    return "Обновлено: --:--"
+
+
+def compose_status(reason=None, cache_note=None, last_success=None, fallback_iso=None):
+    """Финальная строка статуса: причина + пометка кэша + «Обновлено: HH:MM».
+
+    Время успеха добавляется только если оно есть; иначе статус остаётся
+    без него (например, «Нет интернета. Нет данных.»).
+    """
+    parts = []
+    if reason:
+        parts.append(reason)
+    if cache_note:
+        parts.append(cache_note)
+    updated = updated_status_text(last_success, fallback_iso)
+    if not updated.endswith("--:--"):
+        parts.append(updated)
+    if not parts:
+        return updated
+    return " ".join(parts)
+
+
+def success_moment(weather):
+    """Момент УСПЕШНОГО fetch: unix сейчас + offset timezone места из ответа."""
+    try:
+        offset = int(weather.get("utc_offset_seconds") or 0)
+    except Exception:
+        offset = 0
+    return {"unix": int(time.time()), "offset": offset}
+
+
+def record_success_unix(record):
+    """unix последнего успеха из кэш-записи (None, если запись старого формата)."""
+    if not isinstance(record, dict):
+        return None
+    ls = record.get("last_success")
+    if isinstance(ls, dict) and ls.get("unix") is not None:
+        try:
+            return int(ls["unix"])
+        except Exception:
+            return None
+    return None
+
+
+def pick_newer_success(current, incoming):
+    """Не даёт более старому моменту подменить более новый (и наоборот)."""
+    cur = current.get("unix") if isinstance(current, dict) else None
+    inc = incoming.get("unix") if isinstance(incoming, dict) else None
+    if inc is None:
+        return current
+    if cur is None:
+        return incoming
+    return incoming if int(inc) >= int(cur) else current
+
+
+def record_newer_than_success(record, current_success):
+    """Правило write-if-newer/read-if-newer: кэш-файл новее показанного?"""
+    inc = record_success_unix(record)
+    if inc is None:
+        return False
+    cur = current_success.get("unix") if isinstance(current_success, dict) else None
+    if cur is None:
+        return True
+    return int(inc) > int(cur)
+
+
+def bg_valid_coords(coords):
+    """Последние ПОДТВЕРЖДЁННЫЕ координаты: (lat, lon), либо None.
+
+    Фоновому обновлению нужен только кэш-файл — GPS в фоне НЕ запрашивается
+    (нет разрешений на фоновый геолокации и не тратим батарею).
+    """
+    if not isinstance(coords, dict):
+        return None
+    try:
+        lat = float(coords.get("lat"))
+        lon = float(coords.get("lon"))
+    except (TypeError, ValueError):
+        return None
+    # NaN не проходит проверки сравнений, Inf — тоже.
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+    return lat, lon
+
+
+def apply_weather_record(path, weather):
+    """Write-if-newer запись нормализованной погоды в кэш-файл.
+
+    Общая часть фонового пути: её делают и run_background_update (сетевой
+    fetch в Python), и consume_bg_raw (приём сырого ответа Java-воркера).
+    Любая ошибка/отказ -> False, файл байт-в-байт НЕ меняется (прежние
+    данные и прежнее «Обновлено» остаются).
+    """
+    if not isinstance(weather, dict) or not weather.get("daily"):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            record = json.load(f)
+    except Exception:
+        return False
+    if not isinstance(record, dict):
+        return False
+    moment = success_moment(weather)
+    ex_unix = record_success_unix(record)
+    if ex_unix is not None and int(ex_unix) > int(moment["unix"]):
+        # Файл новее нашего момента (перевод часов) — write-if-newer, не пишем.
+        return False
+    old_ls = record.get("last_success")
+    if not isinstance(old_ls, dict):
+        old_ls = None
+    coords_full = record.get("coords")
+    new_record = {
+        "coords": coords_full if isinstance(coords_full, dict) else {},
+        "location_name": record.get("location_name") or "",
+        "weather": weather,
+        "last_success": pick_newer_success(old_ls, moment),
+        "saved_at": datetime.now().strftime("%d.%m %H:%M"),
+    }
+    # Атомарная запись: temp-файл + os.replace (читатель не видит полфайла).
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(new_record, f, ensure_ascii=False)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+    return True
+
+
+def run_background_update(path=None, fetch=None):
+    """Фоновое обновление погоды: без UI, без GPS, атомарная запись кэша.
+
+    Берёт последние подтверждённые координаты из кэш-файла, запрашивает
+    Open-Meteo и атомарно перезаписывает файл (write-if-newer: более новый
+    last_success не откатывается, город из кэша не трогаем). Успех -> True;
+    любой отказ (нет файла/координат/сети/валидного ответа) -> False, файл
+    НЕ меняется — время «Обновлено» в статусе не сдвигается без успеха.
+
+    Диагностика: начало/конец печатаются с epoch — по логам видно, что и
+    когда выполнялось.
+    """
+    path = path or CACHE_FILE
+    fetch = fetch or net_get_json
+    t0 = time.time()
+    print(f"[BG] update start epoch={int(t0)} path={path}", flush=True)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            record = json.load(f)
+    except Exception:
+        print(f"[BG] update end ok=False reason=no-cache dur_ms="
+              f"{int((time.time() - t0) * 1000)}", flush=True)
+        return False
+    if not isinstance(record, dict):
+        print(f"[BG] update end ok=False reason=bad-record dur_ms="
+              f"{int((time.time() - t0) * 1000)}", flush=True)
+        return False
+    coords = bg_valid_coords(record.get("coords"))
+    if coords is None:
+        print(f"[BG] update end ok=False reason=no-coords dur_ms="
+              f"{int((time.time() - t0) * 1000)}", flush=True)
+        return False
+    lat, lon = coords
+    url = OPEN_METEO_URL.format(lat=lat, lon=lon)
+    try:
+        _status, data = fetch(url, timeout=20.0)
+    except Exception:
+        print(f"[BG] update end ok=False reason=fetch-failed dur_ms="
+              f"{int((time.time() - t0) * 1000)}", flush=True)
+        return False
+    weather = normalize_weather(data)
+    ok = apply_weather_record(path, weather)
+    print(f"[BG] update end ok={ok} dur_ms={int((time.time() - t0) * 1000)}",
+          flush=True)
+    return ok
+
+
+def consume_bg_raw(path=None):
+    """Принимает сырой ответ Open-Meteo, сохранённый фоновым Java-воркером.
+
+    WorkManager пишет wildvantage_bg_raw.json рядом с кэшем (атомарно);
+    здесь — normalize_weather + та же write-if-newer запись, что и у
+    run_background_update, только без сетевого запроса. Имя raw-файла
+    забирается атомарно (os.replace в *.proc), чтобы параллельный fetch
+    воркера не был съеден. Отказ/битый файл -> False, кэш не меняется.
+    """
+    path = path or CACHE_FILE
+    base = os.path.dirname(os.path.abspath(path))
+    raw_path = os.path.join(base, BG_RAW_FILE)
+    proc = raw_path + ".proc"
+    t0 = time.time()
+    try:
+        os.replace(raw_path, proc)
+    except OSError:
+        return False  # raw-файла нет — нечего принимать
+    try:
+        try:
+            with open(proc, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            print(f"[BG] consume end ok=False reason=bad-raw epoch={int(time.time())}",
+                  flush=True)
+            return False
+        weather = normalize_weather(data)
+        ok = apply_weather_record(path, weather)
+        print(f"[BG] consume end ok={ok} epoch={int(time.time())} dur_ms="
+              f"{int((time.time() - t0) * 1000)}", flush=True)
+        return ok
+    finally:
+        try:
+            if os.path.exists(proc):
+                os.remove(proc)
+        except Exception:
+            pass
 
 
 def fmt_ddmm(iso):
@@ -503,46 +771,36 @@ def wind_text(value):
 
 
 def slice_hours(hours, current_iso, count=24):
-    """Часовые значения, начиная с часа 'сейчас' (для «Ближайшие 24 ч»)."""
+    """Строгий срез UI-ленты: текущий локальный час + следующие count-1 часов.
+
+    Ровно count элементов, когда данных хватает: первый — час «сейчас»
+    (2026-10-04T09 для «сейчас 09:37»), последний — сейчас + (count-1) ч,
+    переход через полночь поддержан. Прошедшие часы в срез не попадают.
+    Нет текущего часа в данных — берём первый будущий; всё устарело —
+    начинаем с начала (показать имеющееся лучше, чем пустоту).
+    """
     if not hours:
         return []
     start = 0
     if isinstance(current_iso, str) and len(current_iso) >= 13 and "T" in current_iso:
-        cur = current_iso[11:13]
+        cur_key = current_iso[:13]  # YYYY-MM-DDTHH
+        exact = None
+        future = None
         for i, h in enumerate(hours):
             t = h.get("time")
-            if isinstance(t, str) and len(t) >= 13 and t[11:13] == cur:
-                start = i
-                break
-    return hours[start:start + count]
-
-
-def slice_hours_from_midnight(hours, current_iso, count=48):
-    """Часы текущего дня начиная с 00:00 + прогноз вперёд (реальные hourly
-    Open-Meteo: прошедшие часы — модельные, они не подписаны как наблюдения)."""
-    if not hours:
-        return []
-    today = None
-    if isinstance(current_iso, str) and len(current_iso) >= 10:
-        today = current_iso[:10]
-    start = 0
-    if today:
-        start = None
-        first_today = None
-        for i, h in enumerate(hours):
-            t = h.get("time")
-            if not isinstance(t, str) or len(t) < 10:
+            if not isinstance(t, str) or len(t) < 13:
                 continue
-            if t[:10] == today:
-                if first_today is None:
-                    first_today = i
-                if len(t) >= 13 and t[11:13] == "00":
-                    start = i
-                    break
-            elif t[:10] > today:
-                break
-        if start is None:
-            start = first_today if first_today is not None else 0
+            k = t[:13]
+            if exact is None and k == cur_key:
+                exact = i
+            if future is None and k > cur_key:
+                future = i
+        if exact is not None:
+            start = exact
+        elif future is not None:
+            start = future
+        else:
+            start = 0
     return hours[start:start + count]
 
 
@@ -573,7 +831,7 @@ MDScreen:
                 halign: "center"
                 bold: True
                 size_hint_y: None
-                height: "40dp"
+                height: max(dp(40), self.texture_size[1] + dp(6))
                 font_size: "22sp"
                 theme_text_color: "Custom"
                 text_color: 0.6, 0.9, 0.6, 1
@@ -599,11 +857,12 @@ MDScreen:
                     size: "48dp", "48dp"
                     on_release: app.search_logic()
 
-            # Переключатель режима
+            # Переключатель режима (фиксированная высота — не зависит от
+            # minimum_height: children с size_hint_y дают в minimum 0)
             MDBoxLayout:
                 orientation: 'horizontal'
                 size_hint_y: None
-                height: self.minimum_height
+                height: "48dp"
                 spacing: "8dp"
                 MDLabel:
                     id: mode_text
@@ -637,7 +896,7 @@ MDScreen:
                     shorten: True
                     shorten_from: "center"
                     size_hint_y: None
-                    height: "30dp"
+                    height: max(dp(30), self.texture_size[1] + dp(6))
                     valign: "middle"
                     text_size: self.width, None
                     theme_text_color: "Custom"
@@ -651,7 +910,7 @@ MDScreen:
                     font_size: "15sp"
                     shorten: True
                     size_hint_y: None
-                    height: "22dp"
+                    height: max(dp(22), self.texture_size[1] + dp(6))
                     valign: "middle"
                     text_size: self.width, None
                     theme_text_color: "Custom"
@@ -664,7 +923,7 @@ MDScreen:
                     font_size: "52sp"
                     bold: True
                     size_hint_y: None
-                    height: "66dp"
+                    height: max(dp(66), self.texture_size[1] + dp(6))
                     valign: "middle"
                     text_size: self.width, None
                     theme_text_color: "Custom"
@@ -674,7 +933,7 @@ MDScreen:
                 MDBoxLayout:
                     orientation: 'horizontal'
                     size_hint_y: None
-                    height: "24dp"
+                    height: max(dp(24), self.minimum_height)
                     MDBoxLayout:
                         size_hint_x: 1
                     MDBoxLayout:
@@ -695,7 +954,7 @@ MDScreen:
                             font_size: "16sp"
                             size_hint: None, None
                             width: "225dp"
-                            height: "24dp"
+                            height: max(dp(24), self.texture_size[1] + dp(4))
                             shorten: True
                             text_size: self.width, None
                             halign: "center"
@@ -709,7 +968,7 @@ MDScreen:
                 MDBoxLayout:
                     orientation: 'horizontal'
                     size_hint_y: None
-                    height: "38dp"
+                    height: max(dp(38), self.minimum_height)
                     MDFloatLayout:
                         size_hint_x: 1
                         MDBoxLayout:
@@ -736,7 +995,8 @@ MDScreen:
                                     halign: "center"
                                     shorten: True
                                     size_hint: None, None
-                                    size: "66dp", "13dp"
+                                    width: "66dp"
+                                    height: max(dp(13), self.texture_size[1] + dp(2))
                                     text_size: self.width, None
                                     theme_text_color: "Custom"
                                     text_color: 0.6, 0.75, 0.6, 1
@@ -748,7 +1008,8 @@ MDScreen:
                                     halign: "center"
                                     shorten: True
                                     size_hint: None, None
-                                    size: "66dp", "20dp"
+                                    width: "66dp"
+                                    height: max(dp(20), self.texture_size[1] + dp(2))
                                     text_size: self.width, None
                                     theme_text_color: "Custom"
                                     text_color: 0.85, 1, 0.85, 1
@@ -778,7 +1039,8 @@ MDScreen:
                                     halign: "center"
                                     shorten: True
                                     size_hint: None, None
-                                    size: "66dp", "13dp"
+                                    width: "66dp"
+                                    height: max(dp(13), self.texture_size[1] + dp(2))
                                     text_size: self.width, None
                                     theme_text_color: "Custom"
                                     text_color: 0.6, 0.75, 0.6, 1
@@ -790,7 +1052,8 @@ MDScreen:
                                     halign: "center"
                                     shorten: True
                                     size_hint: None, None
-                                    size: "66dp", "20dp"
+                                    width: "66dp"
+                                    height: max(dp(20), self.texture_size[1] + dp(2))
                                     text_size: self.width, None
                                     theme_text_color: "Custom"
                                     text_color: 0.85, 1, 0.85, 1
@@ -820,7 +1083,8 @@ MDScreen:
                                     halign: "center"
                                     shorten: True
                                     size_hint: None, None
-                                    size: "66dp", "13dp"
+                                    width: "66dp"
+                                    height: max(dp(13), self.texture_size[1] + dp(2))
                                     text_size: self.width, None
                                     theme_text_color: "Custom"
                                     text_color: 0.6, 0.75, 0.6, 1
@@ -832,7 +1096,8 @@ MDScreen:
                                     halign: "center"
                                     shorten: True
                                     size_hint: None, None
-                                    size: "66dp", "20dp"
+                                    width: "66dp"
+                                    height: max(dp(20), self.texture_size[1] + dp(2))
                                     text_size: self.width, None
                                     theme_text_color: "Custom"
                                     text_color: 0.85, 1, 0.85, 1
@@ -841,7 +1106,7 @@ MDScreen:
                 MDBoxLayout:
                     orientation: 'horizontal'
                     size_hint_y: None
-                    height: "38dp"
+                    height: max(dp(38), self.minimum_height)
                     MDFloatLayout:
                         size_hint_x: 1
                         MDBoxLayout:
@@ -868,7 +1133,8 @@ MDScreen:
                                     halign: "center"
                                     shorten: True
                                     size_hint: None, None
-                                    size: "66dp", "13dp"
+                                    width: "66dp"
+                                    height: max(dp(13), self.texture_size[1] + dp(2))
                                     text_size: self.width, None
                                     theme_text_color: "Custom"
                                     text_color: 0.6, 0.75, 0.6, 1
@@ -880,7 +1146,8 @@ MDScreen:
                                     halign: "center"
                                     shorten: True
                                     size_hint: None, None
-                                    size: "66dp", "20dp"
+                                    width: "66dp"
+                                    height: max(dp(20), self.texture_size[1] + dp(2))
                                     text_size: self.width, None
                                     theme_text_color: "Custom"
                                     text_color: 0.85, 1, 0.85, 1
@@ -910,7 +1177,8 @@ MDScreen:
                                     halign: "center"
                                     shorten: True
                                     size_hint: None, None
-                                    size: "66dp", "13dp"
+                                    width: "66dp"
+                                    height: max(dp(13), self.texture_size[1] + dp(2))
                                     text_size: self.width, None
                                     theme_text_color: "Custom"
                                     text_color: 0.6, 0.75, 0.6, 1
@@ -922,12 +1190,13 @@ MDScreen:
                                     halign: "center"
                                     shorten: True
                                     size_hint: None, None
-                                    size: "66dp", "20dp"
+                                    width: "66dp"
+                                    height: max(dp(20), self.texture_size[1] + dp(2))
                                     text_size: self.width, None
                                     theme_text_color: "Custom"
                                     text_color: 0.85, 1, 0.85, 1
 
-                # Статус обновления
+                # Статус обновления (погода/сеть/кэш)
                 MDLabel:
                     id: status_label
                     text: "Обновлено: --:--"
@@ -936,43 +1205,65 @@ MDScreen:
                     font_size: "13sp"
                     shorten: True
                     size_hint_y: None
-                    height: "20dp"
+                    height: max(dp(20), self.texture_size[1] + dp(6))
                     text_size: self.width, None
                     theme_text_color: "Custom"
                     text_color: 0.55, 0.75, 0.55, 1
 
-                # Кнопка Обновить GPS (центрируется по ширине)
+                # GPS-статус — свой блок внутри карточки (не на поиске/заголовке)
+                MDLabel:
+                    id: gps_status_label
+                    text: ""
+                    halign: "center"
+                    valign: "middle"
+                    font_size: "13sp"
+                    shorten: True
+                    size_hint_y: None
+                    height: max(dp(18), self.texture_size[1] + dp(4))
+                    text_size: self.width, None
+                    theme_text_color: "Custom"
+                    text_color: 0.65, 0.85, 0.65, 1
+
+                # Кнопка Обновить GPS (центрируется по ширине).
+                # Высота строки фиксирована: minimum_height зависел бы от
+                # адаптивной высоты KivyMD-кнопки (её class-rule пересчитывает
+                # width/height из texture_size и перетирает наши значения).
                 MDBoxLayout:
                     orientation: 'horizontal'
                     size_hint_y: None
-                    height: self.minimum_height
+                    height: "48dp"
                     MDBoxLayout:
                         size_hint_x: 1
                     MDFillRoundFlatButton:
                         text: "ОБНОВИТЬ GPS"
-                        size_hint_x: None
-                        width: "240dp"
-                        size_hint_y: None
-                        height: "44dp"
+                        # KivyMD пересчитывает width/height кнопки из
+                        # texture_size и перетирает статические значения —
+                        # ставим пол через родные _min_width/_min_height:
+                        # результат детерминирован и не зависит от шрифта.
+                        _min_width: "240dp"
+                        _min_height: "44dp"
+                        size_hint: None, None
+                        pos_hint: {"center_y": .5}
                         md_bg_color: 0.2, 0.4, 0.2, 1
                         on_release: app.run_gps_logic()
                     MDBoxLayout:
                         size_hint_x: 1
 
-            # Почасовая погода — лента с 00:00 текущего дня
+            # Почасовая погода — ровно 24 карточки: текущий час + следующие 23 часа
             MDLabel:
                 id: hourly_label
                 text: "ПОЧАСОВАЯ ПОГОДА"
                 bold: True
                 size_hint_y: None
-                height: "20dp"
+                height: max(dp(20), self.texture_size[1] + dp(6))
                 theme_text_color: "Custom"
                 text_color: 0.6, 0.9, 0.6, 1
 
             MDScrollView:
                 id: hourly_scroll
                 size_hint_y: None
-                height: "92dp"
+                # Запас под адаптивную высоту ленты (92) + граница ячейки
+                height: "96dp"
                 do_scroll_x: True
                 do_scroll_y: False
                 bar_width: "3dp"
@@ -982,14 +1273,14 @@ MDScreen:
                     size_hint_x: None
                     width: self.minimum_width
                     size_hint_y: None
-                    height: "88dp"
+                    height: max(dp(88), self.minimum_height)
                     spacing: "6dp"
 
             MDLabel:
                 text: "ПРОГНОЗ НА 7 ДНЕЙ"
                 bold: True
                 size_hint_y: None
-                height: "20dp"
+                height: max(dp(20), self.texture_size[1] + dp(6))
                 theme_text_color: "Custom"
                 text_color: 0.6, 0.9, 0.6, 1
 
@@ -1016,6 +1307,8 @@ class WildVantage(MDApp):
         self._gen = 0
         self._last_weather = None
         self._last_coords = None
+        self._last_success = None   # {"unix", "offset"} — последний УСПЕШНЫЙ fetch
+        self._fetch_inflight = False  # идёт живой запрос погоды (синк кэша ждёт)
         self._loc_name = ""
         self._loc_name_coords = ""    # ключ координат владельца текущего названия
         self._reset_gps_state()
@@ -1024,9 +1317,45 @@ class WildVantage(MDApp):
     def on_start(self):
         if platform == "android":
             self._request_permissions()
+            self._schedule_bg_updates()
         self._set_safe_areas()
         self._start_gen = self._gen
         Clock.schedule_once(self._safe_start, 2)
+        # Подхват кэша, пока приложение открыто: фоновый Java-воркер
+        # (WorkManager, ~15 мин) пишет сырой ответ — мы принимаем его в кэш
+        # и обновляем показ без закрытия приложения. Это НЕ механизм
+        # периодического запроса (его делает воркер), а лишь синхронизация
+        # UI с уже записанным результатом.
+        Clock.schedule_interval(self._maybe_sync_from_cache, 60)
+
+    def on_resume(self):
+        # Вернулись из фона: если фон успел записать более свежий кэш —
+        # показываем его сразу (нет in-flight запроса и нет GPS-сессии).
+        self._maybe_sync_from_cache()
+
+    def _maybe_sync_from_cache(self, *args):
+        """Синхронизация UI с кэшем: читаем только более свежие данные."""
+        if getattr(self, "_fetch_inflight", False) or getattr(self, "_gps_active", False):
+            return
+        # Сначала принимаем сырой ответ фонового Java-воркера (без сети —
+        # файл уже записан): кэш обновляется, затем обычный синк его покажет.
+        try:
+            if consume_bg_raw(self.cache_file):
+                self.log("sync: принят сырой ответ фонового воркера")
+        except Exception as e:
+            self._log_exc("consume bg raw (sync)", e)
+        try:
+            with open(self.cache_file, "r", encoding="utf-8") as f:
+                record = json.load(f)
+        except Exception:
+            return
+        if not record_newer_than_success(record, getattr(self, "_last_success", None)):
+            return
+        self.log("sync: кэш новее показанного — перечитываем")
+        try:
+            self.load_cache(gen=self._gen)
+        except Exception as e:
+            self._log_exc("sync load_cache", e)
 
     def _android_insets(self):
         """Верхний/нижний системные инсеты в px (status/nav bar).
@@ -1075,6 +1404,27 @@ class WildVantage(MDApp):
         except Exception:
             pass
 
+    def _schedule_bg_updates(self):
+        """Ставит периодическое фоновое обновление (WorkManager, ~15 мин).
+
+        Вся работа с WorkManager — в Java-классе BgScheduler (путь API
+        проверяется компилятором при сборке), здесь только один вызов через
+        pyjnius. Повторные запуски идемпотентны (unique work + KEEP). Если
+        что-то недоступно — логируем и идём дальше: при открытом приложении
+        запросы работают независимо от фонового расписания.
+        """
+        try:
+            from jnius import autoclass
+
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            BgScheduler = autoclass("org.wildvantage.BgScheduler")
+            ok = BgScheduler.schedule(PythonActivity.mActivity)
+            self.log("bg update scheduled:", ok)
+            return bool(ok)
+        except Exception as e:
+            self._log_exc("schedule bg update", e)
+            return False
+
     def _safe_start(self, *args):
         # Миграция кэша: старые файлы с прежним названием («Косино» и им подобным)
         # удаляем, чтобы название не переживало эту версию.
@@ -1086,6 +1436,13 @@ class WildVantage(MDApp):
             except Exception:
                 pass
         # Ошибка обработки кэша не должна закрывать приложение на старте (~2 с).
+        # Сначала принимаем сырой ответ фонового воркера (если он успел
+        # прийти, пока приложение было закрыто) — затем показываем кэш.
+        try:
+            if consume_bg_raw(self.cache_file):
+                self.log("cache: принят сырой ответ фонового воркера")
+        except Exception as e:
+            self._log_exc("consume bg raw (start)", e)
         # Кэш НЕ подменяет свежие данные: если за 2 с уже пришёл (или идёт)
         # живой запрос — не трогаем показ.
         try:
@@ -1115,6 +1472,18 @@ class WildVantage(MDApp):
     def _set_status(self, text):
         try:
             self.root.ids.status_label.text = text
+        except Exception:
+            pass
+
+    def _set_gps_status(self, text):
+        """GPS-статус — в собственном блоке карточки (gps_status_label).
+
+        Никогда не пишется в строку поиска/заголовок: у него свой id,
+        фиксированный вертикальным потоком между статусом погоды и
+        кнопкой ОБНОВИТЬ GPS.
+        """
+        try:
+            self.root.ids.gps_status_label.text = text or ""
         except Exception:
             pass
 
@@ -1295,13 +1664,13 @@ class WildVantage(MDApp):
             return True
 
     def run_gps_logic(self):
-        self._set_status("Поиск спутников…")
+        self._set_gps_status("Поиск спутников…")
         if gps is None:
-            self._set_status("GPS недоступен")
+            self._set_gps_status("GPS недоступен")
             return
         if not self._has_fine_location():
             self._request_permissions()
-            self._set_status("Нужно разрешение на точное местоположение")
+            self._set_gps_status("Нужно разрешение на точное местоположение")
             return
         # Инвалидируем влетающие запросы предыдущего обновления (гонка):
         # их колбэки с gen != self._gen  будут отброшены.
@@ -1314,13 +1683,13 @@ class WildVantage(MDApp):
             try:
                 gps.configure(on_location=self.on_gps_loc)
             except Exception:
-                self._set_status("Ошибка GPS: включите спутники")
+                self._set_gps_status("Ошибка GPS: включите спутники")
                 return
         try:
             # частые обновления: было 1000 мс, теперь 500 мс
             gps.start(minTime=500, minDistance=0)
         except Exception:
-            self._set_status("Ошибка GPS: включите спутники")
+            self._set_gps_status("Ошибка GPS: включите спутники")
             return
         self._gps_active = True
         self._gps_deadline = Clock.schedule_once(
@@ -1353,7 +1722,7 @@ class WildVantage(MDApp):
         try:
             self.log("gps status:", args)
             if args and args[0] == "provider-disabled" and getattr(self, "_gps_active", False):
-                self._set_status("GPS выключен — включите спутники")
+                self._set_gps_status("GPS выключен — включите спутники")
         except Exception as e:
             self._log_exc("on_gps_status", e)
 
@@ -1421,7 +1790,7 @@ class WildVantage(MDApp):
             )
 
         best_acc = self._gps_best["accuracy"]
-        self._set_status(f"Уточнение GPS… ±{best_acc:.0f} м")
+        self._set_gps_status(f"Уточнение GPS… ±{best_acc:.0f} м")
 
         if best_acc <= GPS_GOOD_ACCURACY:
             self._finish_gps("точность ≤10 м")
@@ -1437,13 +1806,15 @@ class WildVantage(MDApp):
         best = self._gps_best
         if best is None:
             self.log("gps: завершение —", reason, "| валидных fix нет")
-            self._set_status("GPS: нет сигнала. Проверьте небо и разрешение.")
+            self._set_gps_status("GPS: нет сигнала. Проверьте небо и разрешение.")
             return
         self.log(
             "gps: завершение —", reason,
             "| измерений:", len(self._gps_fixes),
             "| лучший ±", best["accuracy"], "м",
         )
+        # Итог GPS — в свой блок (не в статус погоды).
+        self._set_gps_status(f"GPS: ±{best['accuracy']:.0f} м")
         timeout = 3 if self.is_wilderness else 20
         self.start_update(
             best["lat"], best["lon"],
@@ -1457,6 +1828,7 @@ class WildVantage(MDApp):
         self._gen += 1
         gen = self._gen
         self._last_weather = None
+        self._fetch_inflight = True
         self._last_coords = {"lat": lat, "lon": lon, "accuracy": accuracy}
         self._set_coords_text(lat, lon, accuracy)
         try:
@@ -1546,6 +1918,7 @@ class WildVantage(MDApp):
         def success(_req, result):
             if gen != self._gen:
                 return
+            self._fetch_inflight = False
             weather = normalize_weather(result)
             if not weather or not weather.get("daily"):
                 self.log("weather: пустой ответ")
@@ -1557,6 +1930,10 @@ class WildVantage(MDApp):
                 )
                 return
             self._last_weather = weather
+            # Последний УСПЕШНЫЙ fetch: unix сейчас + offset timezone места.
+            self._last_success = pick_newer_success(
+                getattr(self, "_last_success", None), success_moment(weather)
+            )
             self.log("weather: источник = Open-Meteo (API)")
             self.log(
                 "weather:",
@@ -1578,6 +1955,7 @@ class WildVantage(MDApp):
         def error(_req, err):
             if gen != self._gen:
                 return
+            self._fetch_inflight = False
             self.log("weather error:", err)
             self.load_cache(
                 gen=gen,
@@ -1621,7 +1999,7 @@ class WildVantage(MDApp):
             pass
 
         self._fill_hours(
-            slice_hours_from_midnight(weather.get("hours") or [], cur.get("time")),
+            slice_hours(weather.get("hours") or [], cur.get("time")),
             cur.get("time"),
         )
 
@@ -1637,49 +2015,39 @@ class WildVantage(MDApp):
 
         if not from_cache:
             # Для кэша финальный статус формирует load_cache (с причиной).
-            self._set_status(updated_status_text(cur.get("time")))
+            # Время — только от последнего УСПЕШНОГО fetch (self._last_success).
+            self._set_status(
+                updated_status_text(getattr(self, "_last_success", None),
+                                    cur.get("time"))
+            )
 
     def _fill_hours(self, hours, current_time=None):
-        """Строит ленту «ПОЧАСОВАЯ ПОГОДА» с 00:00 текущего дня.
+        """Строит ленту «ПОЧАСОВАЯ ПОГОДА»: ровно 24 карточки.
 
-        Текущий час подсвечен и подписан «Сейчас», прошедшие приглушены;
-        после отрисовки лента прокручивается к текущему часу.
+        Первый элемент — текущий локальный час (подписан «Сейчас»),
+        далее следующие 23 часа (переход через полночь поддержан).
+        Прошедшие часы в UI не отображаются; после обновления лента
+        стоит в начале (scroll_x = 0) — автоскролл не нужен.
         """
         try:
             row = self.root.ids.hourly_row
+            scroll = self.root.ids.hourly_scroll
         except Exception:
             return
+        if current_time:
+            hours = slice_hours(hours, current_time, count=24)
+        else:
+            hours = (list(hours) if hours else [])[:24]
         row.clear_widgets()
-        current_idx = -1
-        for i, h in enumerate(hours):
+        for h in hours[:24]:
             try:
-                if self._build_hour_cell(row, h, current_time):
-                    current_idx = i
+                self._build_hour_cell(row, h, current_time)
             except Exception as e:
                 self._log_exc("hour cell", e)
-        self._scroll_hourly_to_now(current_idx)
-
-    def _scroll_hourly_to_now(self, current_idx):
-        """Прокрутка ленты так, чтобы текущий час был по центру видимой части."""
-        if current_idx is None or current_idx < 0:
-            return
-
-        def _do(_dt):
-            try:
-                scroll = self.root.ids.hourly_scroll
-                row = self.root.ids.hourly_row
-                cell_step = 52 + 6
-                content_w = row.width
-                view_w = scroll.width
-                max_scroll = content_w - view_w
-                if max_scroll <= 0:
-                    return
-                desired = current_idx * cell_step + 26 - view_w / 2.0
-                scroll.scroll_x = max(0.0, min(1.0, desired / max_scroll))
-            except Exception as e:
-                self._log_exc("hourly auto-scroll", e)
-
-        Clock.schedule_once(_do, 0)
+        try:
+            scroll.scroll_x = 0
+        except Exception:
+            pass
 
     def _build_hour_cell(self, row, h, current_time=None):
         time_iso = str(h.get("time") or "")
@@ -1701,8 +2069,13 @@ class WildVantage(MDApp):
             orientation="vertical",
             spacing="2dp",
             size_hint=(None, None),
-            size=("52dp", "88dp"),
+            width=dp(52),
+            height=dp(88),
         )
+        # Ячейка адаптируется к содержимому (высоты строк защищены от
+        # texture-размеров шрифта), но не меньше стандартных 88dp.
+        box.bind(minimum_height=lambda inst, mh: setattr(
+            inst, "height", max(dp(88), mh)))
         if is_current and Color is not None and RoundedRectangle is not None:
             # Подсветка текущего часа: скруглённая подложка (canvas, не pos_hint)
             try:
@@ -1727,20 +2100,30 @@ class WildVantage(MDApp):
             icon_color = (0.85, 1, 0.85, 1)
             temp_color = (0.95, 1, 0.95, 1)
 
-        box.add_widget(
+        # Каждая строка ячейки: высота не меньше текстуры (+2dp запас) —
+        # текст физически не вылезает за строку ни при каких метриках шрифта.
+        def _guarded(w, base):
+            w.height = base
+            w.bind(texture_size=lambda inst, ts, b=base: setattr(
+                inst, "height", max(b, ts[1] + dp(2))))
+            return w
+
+        # Всегда HH:MM — текущий час дополнительно выделен подписью «Сейчас»
+        # и подсветкой (текст времени не заменяется).
+        box.add_widget(_guarded(
             MDLabel(
-                text="Сейчас" if is_current else fmt_hhmm(h.get("time")),
+                text=fmt_hhmm(h.get("time")),
                 font_size="12sp",
                 bold=is_current,
                 halign="center",
                 size_hint=(None, None),
-                size=("52dp", "18dp"),
-                text_size=(None, None),
+                width=dp(52),
                 theme_text_color="Custom",
-                text_color=time_color,
-            )
-        )
-        box.add_widget(
+                text_color=(0.85, 1, 0.85, 1) if is_current else time_color,
+            ),
+            dp(16),
+        ))
+        box.add_widget(_guarded(
             MDIcon(
                 icon=icon,
                 font_size="22sp",
@@ -1748,22 +2131,38 @@ class WildVantage(MDApp):
                 theme_text_color="Custom",
                 text_color=icon_color,
                 size_hint=(None, None),
-                size=("52dp", "28dp"),
-            )
-        )
-        box.add_widget(
+                width=dp(52),
+            ),
+            dp(26),
+        ))
+        box.add_widget(_guarded(
             MDLabel(
                 text=fmt_temp(h.get("temp")),
                 font_size="14sp",
                 bold=True,
                 halign="center",
                 size_hint=(None, None),
-                size=("52dp", "20dp"),
-                text_size=(None, None),
+                width=dp(52),
                 theme_text_color="Custom",
                 text_color=temp_color,
-            )
-        )
+            ),
+            dp(18),
+        ))
+        # Компактная подпись текущего часа (пустая у остальных — сохраняем
+        # единый ритм ленты).
+        box.add_widget(_guarded(
+            MDLabel(
+                text="Сейчас" if is_current else "",
+                font_size="11sp",
+                bold=is_current,
+                halign="center",
+                size_hint=(None, None),
+                width=dp(52),
+                theme_text_color="Custom",
+                text_color=(0.6, 1, 0.6, 1) if is_current else (0, 0, 0, 0),
+            ),
+            dp(14),
+        ))
         row.add_widget(box)
         return is_current
 
@@ -1803,6 +2202,15 @@ class WildVantage(MDApp):
         forecast_list.add_widget(item)
 
     # --- КЭШ ---
+    def _read_cache_record(self):
+        """Кэш-запись или None. Ошибка чтения — не исключение."""
+        try:
+            with open(self.cache_file, "r", encoding="utf-8") as f:
+                record = json.load(f)
+            return record if isinstance(record, dict) else None
+        except Exception:
+            return None
+
     def _save_cache(self):
         if not self._last_weather or not self._last_coords:
             return
@@ -1810,18 +2218,42 @@ class WildVantage(MDApp):
             "coords": self._last_coords,
             "location_name": self._loc_name,
             "weather": self._last_weather,
+            "last_success": getattr(self, "_last_success", None),
             "saved_at": datetime.now().strftime("%d.%m %H:%M"),
         }
+        # Write-if-newer: более свежий файл (фоновое обновление) не затираем.
+        existing = self._read_cache_record()
+        if existing is not None:
+            ex_unix = record_success_unix(existing)
+            our_ls = getattr(self, "_last_success", None)
+            our_unix = our_ls.get("unix") if isinstance(our_ls, dict) else None
+            if ex_unix is not None and (our_unix is None or int(ex_unix) > int(our_unix)):
+                self.log("cache: файл новее — запись пропущена", ex_unix, ">", our_unix)
+                return
+        # Атомарная запись: temp-файл + os.replace (читатель не увидит полфайла).
+        tmp = self.cache_file + ".tmp"
         try:
-            with open(self.cache_file, "w", encoding="utf-8") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(record, f, ensure_ascii=False)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            os.replace(tmp, self.cache_file)
         except Exception:
-            pass
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
 
     def load_cache(self, gen=None, city_filter=None, show_err=False,
                    requested=None, status_msg=None):
         """Показать кэш. Статус всегда составляется здесь: причина (status_msg)
-        + пометка, что данные из кэша. Свежий API приоритетнее кэша (gen-guard).
+        + пометка, что данные из кэша + «Обновлено: HH:MM» последнего
+        УСПЕШНОГО обновления (из кэша — это фактическое время фонового
+        обновления, не время открытия). Свежий API приоритетнее кэша (gen-guard).
         Возвращает True, если данные кэша показаны.
         """
         if gen is not None and gen != self._gen:
@@ -1829,7 +2261,14 @@ class WildVantage(MDApp):
 
         def fail(text):
             try:
-                self._set_status(text)
+                self._set_status(
+                    compose_status(
+                        text,
+                        None,
+                        getattr(self, "_last_success", None),
+                        None,
+                    )
+                )
             except Exception:
                 pass
             return False
@@ -1854,6 +2293,13 @@ class WildVantage(MDApp):
                 return fail(f"{status_msg}. Нет данных.")
             return fail("Кэш повреждён — включите интернет")
 
+        # Время успеха: не даём более старой кэш-записи откатить более свежий
+        # момент из памяти (ошибка API не меняет время последнего успеха).
+        self._last_success = pick_newer_success(
+            getattr(self, "_last_success", None), record.get("last_success")
+        )
+        fallback_iso = (weather.get("current") or {}).get("time")
+
         is_far = bool(requested) and self._coords_far(requested, coords)
         if is_far:
             # Кэш другого места: координаты/название не подменяем на чужие,
@@ -1870,21 +2316,29 @@ class WildVantage(MDApp):
             self._loc_name_coords = f"{coords.get('lat', 0):.5f}, {coords.get('lon', 0):.5f}"
         self.process_weather(weather, coords, from_cache=True)
 
+        note = "Данные из кэша (другое место)." if is_far else "Данные из кэша."
         if status_msg:
-            if is_far:
-                self._set_status(f"{status_msg}. Данные из кэша (другое место).")
-            else:
-                self._set_status(f"{status_msg}. Данные из кэша.")
+            reason = status_msg
+            if not reason.endswith((".", "!", "?")):
+                reason += "."
+            self._set_status(
+                compose_status(reason, note, self._last_success, fallback_iso)
+            )
             return True
-        if is_far:
-            self._set_status("Данные из кэша (другое место)")
-        elif show_err:
-            self._set_status("Данные из кэша")
+        if is_far or show_err:
+            self._set_status(
+                compose_status(None, note, self._last_success, fallback_iso)
+            )
         elif city_filter:
-            self._set_status("Офлайн: данные из кэша")
+            self._set_status(
+                compose_status(
+                    "Офлайн: данные из кэша.", None, self._last_success, fallback_iso
+                )
+            )
         else:
-            saved = record.get("saved_at")
-            self._set_status(f"Данные из кэша ({saved})" if saved else "Данные из кэша")
+            self._set_status(
+                compose_status(None, note, self._last_success, fallback_iso)
+            )
         return True
 
     def _coords_far(self, a, b):
