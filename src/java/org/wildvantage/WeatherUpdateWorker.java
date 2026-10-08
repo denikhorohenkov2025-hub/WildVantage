@@ -22,8 +22,9 @@ import java.util.Date;
 import java.util.Locale;
 
 /**
- * Периодический воркер WorkManager (~15 мин): сам делает запрос Open-Meteo
- * и атомарно сохраняет СЫРОЙ ответ рядом с кэшем (wildvantage_bg_raw.json).
+ * Периодический воркер WorkManager (~15 мин): сам делает запрос MET Norway
+ * (locationforecast) и атомарно сохраняет СЫРОЙ ответ рядом с кэшем
+ * (wildvantage_bg_raw_v2.json).
  *
  * Почему воркер не запускает Python-сервис (проверено по AOSP android-12):
  * обычный Context.startService() из фонового процесса бросает
@@ -33,31 +34,31 @@ import java.util.Locale;
  * фоновая работа выполняется здесь, внутри job'а, без сервисов и уведомлений.
  *
  * Python (при открытии/раз в 60 секунд) принимает сырой файл:
- * normalize_weather + write-if-newer атомарная запись кэша. Ошибка сети или
+ * normalize_metno + write-if-newer атомарная запись кэша. Ошибка сети или
  * отказ валидации ничего не меняет — прежние данные и прежнее «Обновлено»
  * остаются. GPS в фоне не запрашивается: координаты берутся из кэша.
+ *
+ * ToS MET Norway: обязателен идентифицирующий User-Agent (без него 403),
+ * координаты максимум 4 знака после запятой. Accept-Encoding не шлём —
+ * ответ приходит без gzip, декодирование не нужно.
  */
 public class WeatherUpdateWorker extends Worker {
 
     private static final String TAG = "WildVantage";
-    private static final String CACHE_FILE = "wildvantage_v4.json";
-    private static final String RAW_FILE = "wildvantage_bg_raw.json";
-    private static final String RAW_TMP = "wildvantage_bg_raw.json.tmp";
+    private static final String CACHE_FILE = "wildvantage_v5.json";
+    private static final String RAW_FILE = "wildvantage_bg_raw_v2.json";
+    private static final String RAW_TMP = "wildvantage_bg_raw_v2.json.tmp";
     private static final long CONNECT_TIMEOUT_MS = 15_000L;
     private static final long READ_TIMEOUT_MS = 20_000L;
     private static final int MAX_BODY_BYTES = 8 * 1024 * 1024;
     private static final int MAX_FETCH_ATTEMPTS = 3;
+    // complete (не compact): единственный вариант с apparent_air_temperature.
+    // %.4f — требование ToS (более точные координаты -> 403).
     private static final String URL_TEMPLATE =
-            "https://api.open-meteo.com/v1/forecast"
-                    + "?latitude=%s&longitude=%s"
-                    + "&current=temperature_2m,weather_code,cloud_cover,is_day,"
-                    + "apparent_temperature,relative_humidity_2m,wind_speed_10m,"
-                    + "wind_direction_10m,wind_gusts_10m"
-                    + "&hourly=temperature_2m,weather_code,is_day,"
-                    + "apparent_temperature,precipitation_probability"
-                    + "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
-                    + "sunrise,sunset,precipitation_probability_max,wind_speed_10m_max"
-                    + "&timezone=auto&forecast_days=7";
+            "https://api.met.no/weatherapi/locationforecast/2.0/complete"
+                    + "?lat=%s&lon=%s";
+    private static final String MET_UA =
+            "WILDVANTAGE/13.0.4 (github.com/denikhorohenkov2025-hub/WildVantage)";
 
     public WeatherUpdateWorker(Context context, WorkerParameters params) {
         super(context, params);
@@ -94,8 +95,8 @@ public class WeatherUpdateWorker extends Worker {
                 return Result.success();
             }
             String url = String.format(Locale.US, URL_TEMPLATE,
-                    String.format(Locale.US, "%.6f", lat),
-                    String.format(Locale.US, "%.6f", lon));
+                    String.format(Locale.US, "%.4f", lat),
+                    String.format(Locale.US, "%.4f", lon));
             byte[] body = httpGet(url);
             // Атомарная запись сырого ответа: tmp + fsync + rename.
             File tmp = new File(dir, RAW_TMP);
@@ -150,7 +151,8 @@ public class WeatherUpdateWorker extends Worker {
             conn.setReadTimeout((int) READ_TIMEOUT_MS);
             conn.setRequestMethod("GET");
             conn.setInstanceFollowRedirects(true);
-            conn.setRequestProperty("User-Agent", "WildVantage/13.0.2 (Android)");
+            conn.setRequestProperty("User-Agent", MET_UA);
+            conn.setRequestProperty("Accept", "application/json");
             int status = conn.getResponseCode();
             if (status != HttpURLConnection.HTTP_OK) {
                 throw new IOException("http status " + status);

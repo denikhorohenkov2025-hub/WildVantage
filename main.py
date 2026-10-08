@@ -1,5 +1,7 @@
+import gzip
 import http.client
 import json
+import math
 import os
 import socket
 import ssl
@@ -18,6 +20,13 @@ from kivymd.uix.boxlayout import MDBoxLayout
 from kivymd.uix.floatlayout import MDFloatLayout
 from kivymd.uix.label import MDLabel, MDIcon
 
+# Часовой пояс места (IANA): на Android нет системного tzdata — ставим
+# пакет tzdata в requirements; без него работаем с фиксированным сдвигом.
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
 # GPS — отдельным try/except, чтобы сбой импорта не ронял приложение
 try:
     from plyer import gps
@@ -34,11 +43,16 @@ except Exception:
     Color = None
     RoundedRectangle = None
 
-CACHE_FILE = "wildvantage_v4.json"
-# Сырой ответ Open-Meteo, который атомарно пишет фоновый Java-воркер
+CACHE_FILE = "wildvantage_v5.json"
+# Сырой ответ MET Norway, который атомарно пишет фоновый Java-воркер
 # (WorkManager) рядом с кэшем; Python принимает его в consume_bg_raw.
-BG_RAW_FILE = "wildvantage_bg_raw.json"
+BG_RAW_FILE = "wildvantage_bg_raw_v2.json"
+APP_VERSION = "13.0.4"
 NOMINATIM_UA = "WildVantage (Android weather app; contact: denikhorohenkov2025-hub)"
+# MET Norway требует идентифицирующий User-Agent (иначе 403): имя приложения
+# + версия + контакт. Запрещены generic-строки вроде okhttp/Dalvik/Java.
+MET_UA = (f"WILDVANTAGE/{APP_VERSION} "
+          "(github.com/denikhorohenkov2025-hub/WildVantage)")
 
 # Сбор GPS: ищем лучший fix, не берём первый грубый.
 GPS_SEARCH_TIMEOUT = 28   # максимум ожидания хорошего fix, сек
@@ -47,21 +61,35 @@ GPS_OK_ACCURACY = 20.0    # при <=20 м можно принять, если �
 GPS_SETTLE_TIME = 6.0     # сколько ждать улучшения при <=20 м, сек
 GPS_STALE_AGE = 8.0       # fix старше этого возраста отбрасываем, сек
 
-# Погода: Open-Meteo (бесплатно, без ключа).
-# current: температура, ощущается, влажность, ветер, код WMO, облачность, день/ночь
-# hourly:  почасовая температура/осадки/день-ночь — для «Ближайшие 24 ч»
-# daily:   на 7 дней: код WMO, tmax/tmin, восход/закат, вероятность осадков, ветер
-OPEN_METEO_URL = (
-    "https://api.open-meteo.com/v1/forecast"
-    "?latitude={lat}&longitude={lon}"
-    "&current=temperature_2m,weather_code,cloud_cover,is_day,apparent_temperature,relative_humidity_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m"
-    "&hourly=temperature_2m,weather_code,is_day,apparent_temperature,precipitation_probability"
-    "&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,precipitation_probability_max,wind_speed_10m_max"
-    "&timezone=auto&forecast_days=7"
-)
+# Погода: MET Norway Locationforecast 2.0 (бесплатно, без ключа).
+# Почему НЕ Open-Meteo: с устройства подтверждено «без VPN не обновляется»
+# (Wi-Fi и мобильный интернет), с VPN работает — Open-Meteo недоступен с
+# этого телефона напрямую. MET Norway отвечает 200 с обычного соединения.
+# complete (не compact): единственный вариант с apparent_air_temperature
+# («ощущается»). Координаты — максимум 4 знака (требование ToS, иначе 403).
+MET_FORECAST_URL = "https://api.met.no/weatherapi/locationforecast/2.0/complete"
+
+
+def met_forecast_url(lat, lon):
+    """URL прогноза MET Norway: координаты усечены до 4 знаков (ToS)."""
+    try:
+        la = math.trunc(float(lat) * 10000) / 10000.0
+        lo = math.trunc(float(lon) * 10000) / 10000.0
+    except (TypeError, ValueError):
+        la, lo = float(lat), float(lon)
+    return f"{MET_FORECAST_URL}?lat={la}&lon={lo}"
+
+
+# Геокодер (название места). Погода от него НЕ зависит: это отдельный
+# запрос. Nominatim — первичный (чужой CDN, работает и без Open-Meteo),
+# Open-Meteo geocoding — резерв при недоступности Nominatim.
 GEOCODE_URL = (
     "https://geocoding-api.open-meteo.com/v1/search"
     "?name={q}&count=1&language=ru&format=json"
+)
+NOMINATIM_SEARCH_URL = (
+    "https://nominatim.openstreetmap.org/search"
+    "?format=jsonv2&q={q}&limit=1&addressdetails=1&accept-language=ru"
 )
 REVERSE_URL = (
     "https://nominatim.openstreetmap.org/reverse"
@@ -80,7 +108,7 @@ PROBE_TARGETS = (
     ("1.1.1.1", 443),
     ("8.8.8.8", 443),
     ("2606:4700:4700::1111", 443),
-    ("api.open-meteo.com", 443),
+    ("api.met.no", 443),
     ("nominatim.openstreetmap.org", 443),
 )
 
@@ -162,7 +190,8 @@ def _open_connection(addrinfo, server_hostname, timeout, context):
         raise
 
 
-def net_get(url, timeout=12.0, headers=None, resolver=None, opener=None):
+def net_get(url, timeout=12.0, headers=None, resolver=None, opener=None,
+            _redirects=0):
     """GET с раздельной диагностикой: dns / connect / tls / timeout / http.
 
     resolver(host, port) -> [addrinfo, ...]; opener(addrinfo, host, timeout,
@@ -170,6 +199,8 @@ def net_get(url, timeout=12.0, headers=None, resolver=None, opener=None):
     4xx/5xx НЕ ретраятся: сервер ответил, адреса пробовать незачем.
     До 2 проходов по адресам (ограниченный retry со свежим DNS), общий
     бюджет timeout на оба прохода — бесконечных циклов нет.
+    Редиректы (301/302/303/307/308) следуются максимум 3 раза — этого
+    требует ToS MET Norway; gzip-ответы (Content-Encoding) распаковываются.
     """
     resolver = resolver or resolve_addrs
     opener = opener or _open_connection
@@ -185,6 +216,9 @@ def net_get(url, timeout=12.0, headers=None, resolver=None, opener=None):
     conn_cls = http.client.HTTPSConnection if use_tls else http.client.HTTPConnection
     deadline = time.monotonic() + timeout
     errors = []
+    send_headers = dict(headers or {})
+    if not any(str(k).lower() == "accept-encoding" for k in send_headers):
+        send_headers["Accept-Encoding"] = "gzip"
 
     for pass_no in range(2):
         try:
@@ -219,9 +253,11 @@ def net_get(url, timeout=12.0, headers=None, resolver=None, opener=None):
             try:
                 conn = conn_cls(host, port, timeout=max(0.5, deadline - time.monotonic()))
                 conn.sock = sock
-                conn.request("GET", path, headers=headers or {})
+                conn.request("GET", path, headers=send_headers)
                 resp = conn.getresponse()
                 status = resp.status
+                location = resp.getheader("Location")
+                content_enc = (resp.getheader("Content-Encoding") or "").lower()
                 body = resp.read(2_000_000)
                 conn.close()
             except (socket.timeout, TimeoutError) as e:
@@ -238,6 +274,24 @@ def net_get(url, timeout=12.0, headers=None, resolver=None, opener=None):
                 except Exception:
                     pass
                 continue
+            if status in (301, 302, 303, 307, 308) and location:
+                if _redirects < 3:
+                    next_url = urllib.parse.urljoin(url, location)
+                    scheme = urllib.parse.urlsplit(next_url).scheme
+                    if scheme in ("http", "https"):
+                        remain = deadline - time.monotonic()
+                        if remain > 0.5:
+                            return net_get(next_url, timeout=remain,
+                                           headers=headers, resolver=resolver,
+                                           opener=opener, _redirects=_redirects + 1)
+                raise NetError("http", host, f"HTTP {status} (redirect)", status=status)
+            if "gzip" in content_enc and body:
+                try:
+                    body = gzip.decompress(body)
+                except Exception:
+                    # Битый gzip: оставляем как есть — JSON-разбор даст
+                    # классифицированную ошибку json.
+                    pass
             if 200 <= status < 300:
                 return status, body
             raise NetError("http", host, f"HTTP {status}", status=status)
@@ -288,6 +342,92 @@ def probe_online(timeout=1.5, targets=None, total=None):
             continue
     return False
 
+
+def net_probe_line(url, label, headers=None, timeout=6.0):
+    """Один HTTP-проб для диагностики: (ok, строка отчёта) без ретраев."""
+    t0 = time.monotonic()
+    try:
+        status, _body = net_get(url, timeout=timeout, headers=headers)
+        ms = int((time.monotonic() - t0) * 1000)
+        return True, f"{label}: HTTP {status} за {ms} мс"
+    except NetError as e:
+        ms = int((time.monotonic() - t0) * 1000)
+        detail = e.detail or e.host or ""
+        return False, f"{label}: {e.kind} — {detail} ({ms} мс)"
+    except Exception as e:
+        ms = int((time.monotonic() - t0) * 1000)
+        return False, f"{label}: {type(e).__name__}: {e} ({ms} мс)"
+
+
+def net_diagnose():
+    """Синхронная диагностика сети -> (met_ok, [строки отчёта]).
+
+    Проверяет по порядку: DNS системного резолвера (сам предмет диагностики),
+    DoH-резолвинг Cloudflare (доказательство обхода DPI/блокировок на сети),
+    MET Norway (целевой API погоды, с User-Agent — ровно рабочий запрос
+    приложения), Nominatim (первичный геокодер) и Open-Meteo geocoding
+    (резервный геокодер). Без UI — вызывается из фонового потока и
+    переиспользуется в тестах; никаких секретов в строки не попадает.
+    """
+    lines = []
+
+    # 1) DNS системного резолвера — что именно видит телефон.
+    t0 = time.monotonic()
+    try:
+        addrs = resolve_addrs("api.met.no", 443)
+        ips = ", ".join(str(a[4][0]) for a in addrs[:4])
+        ms = int((time.monotonic() - t0) * 1000)
+        lines.append(f"DNS api.met.no -> {ips} ({ms} мс)")
+    except Exception as e:
+        lines.append(f"DNS api.met.no: {type(e).__name__}: {e}")
+    t0 = time.monotonic()
+    try:
+        addrs = resolve_addrs("geocoding-api.open-meteo.com", 443)
+        ips = ", ".join(str(a[4][0]) for a in addrs[:4])
+        ms = int((time.monotonic() - t0) * 1000)
+        lines.append(f"DNS geocoding-api.open-meteo.com -> {ips} ({ms} мс)")
+    except Exception as e:
+        lines.append(f"DNS geocoding-api.open-meteo.com: {type(e).__name__}: {e}")
+
+    # 2) DoH: если обычный DNS отравлен/заблокирован, а DoH отвечает —
+    #    блокировка обходится штатными средствами сети.
+    doh = ("https://cloudflare-dns.com/dns-query?name=api.met.no&type=A")
+    ok, line = net_probe_line(doh, "DoH cloudflare-dns.com (A api.met.no)",
+                              headers={"Accept": "application/dns-json"},
+                              timeout=6.0)
+    lines.append(line)
+
+    # 3) MET Norway — главный вопрос «без VPN работает?».
+    met_ok, met_line = net_probe_line(
+        met_forecast_url(55.75, 37.62), "MET Norway (прогноз)",
+        headers={"User-Agent": MET_UA, "Accept": "application/json"},
+        timeout=8.0,
+    )
+    lines.append(met_line)
+
+    # 4) Геокодеры: первичный и резервный.
+    geo_ok, geo_line = net_probe_line(
+        NOMINATIM_SEARCH_URL.format(q="Moscow"), "Nominatim (поиск)",
+        headers={"User-Agent": NOMINATIM_UA, "Accept-Language": "ru"},
+        timeout=6.0,
+    )
+    lines.append(geo_line)
+    fb_ok, fb_line = net_probe_line(
+        GEOCODE_URL.format(q="Moscow"), "Open-Meteo geocoding (резерв)",
+        timeout=6.0,
+    )
+    lines.append(fb_line)
+
+    lines.append(
+        "Итог: MET Norway " + ("отвечает — VPN не требуется" if met_ok
+                               else "НЕ отвечает — нужна проверка на устройстве")
+    )
+    lines.append(
+        "Геокодер: Nominatim " + ("OK" if geo_ok else "недоступен")
+        + " / резерв " + ("OK" if fb_ok else "недоступен")
+    )
+    return met_ok, lines
+
 # WMO weather_code -> (описание, иконка днём, иконка ночью)
 WMO = {
     0: ("Ясно", "weather-sunny", "weather-night"),
@@ -331,6 +471,224 @@ def wmo_info(code, is_day=True):
     if entry is None:
         return WMO_FALLBACK[0], (WMO_FALLBACK[1] if is_day else WMO_FALLBACK[2])
     return entry[0], (entry[1] if is_day else entry[2])
+
+
+# --- MET Norway symbol_code -> русское описание + иконка KivyMD -------------
+# Источник списка — официальный OpenAPI MET Norway (enum symbol_code, 83
+# значения). Ключ таблицы — базовый символ БЕЗ суффикса варианта
+# (_day / _night / _polartwilight). Суффикс _night имеет приоритет над
+# признаком is_day: модель уже разделила день/ночь. У ряда символов
+# (cloudy, fog, rain...) суффикса нет — там день/ночь считается по
+# восходу/закату (см. normalize_metno).
+MET_SYMBOL_BASES = {
+    # Ясно / малооблачно
+    "clearsky": ("Ясно", "weather-sunny", "weather-night"),
+    "fair": ("Преимущественно ясно", "weather-sunny", "weather-night"),
+    "partlycloudy": ("Переменная облачность", "weather-partly-cloudy",
+                     "weather-night-partly-cloudy"),
+    "cloudy": ("Пасмурно", "weather-cloudy", "weather-cloudy"),
+    "fog": ("Туман", "weather-fog", "weather-fog"),
+    # Дождь
+    "lightrain": ("Небольшой дождь", "weather-rainy", "weather-rainy"),
+    "rain": ("Дождь", "weather-rainy", "weather-rainy"),
+    "heavyrain": ("Сильный дождь", "weather-pouring", "weather-pouring"),
+    "lightrainshowers": ("Небольшой ливень", "weather-partly-rainy",
+                         "weather-partly-rainy"),
+    "rainshowers": ("Ливень", "weather-rainy", "weather-rainy"),
+    "heavyrainshowers": ("Сильный ливень", "weather-pouring", "weather-pouring"),
+    # Дождь с грозой
+    "lightrainandthunder": ("Небольшой дождь с грозой", "weather-lightning-rainy",
+                            "weather-lightning-rainy"),
+    "rainandthunder": ("Дождь с грозой", "weather-lightning-rainy",
+                       "weather-lightning-rainy"),
+    "heavyrainandthunder": ("Сильный дождь с грозой", "weather-lightning-rainy",
+                            "weather-lightning-rainy"),
+    "lightrainshowersandthunder": ("Небольшой ливень с грозой",
+                                   "weather-lightning-rainy",
+                                   "weather-lightning-rainy"),
+    "rainshowersandthunder": ("Ливень с грозой", "weather-lightning-rainy",
+                              "weather-lightning-rainy"),
+    "heavyrainshowersandthunder": ("Сильный ливень с грозой",
+                                   "weather-lightning-rainy",
+                                   "weather-lightning-rainy"),
+    # Мокрый снег (снежно-дождевые осадки)
+    "lightsleet": ("Слабый мокрый снег", "weather-snowy-rainy", "weather-snowy-rainy"),
+    "sleet": ("Мокрый снег", "weather-snowy-rainy", "weather-snowy-rainy"),
+    "heavysleet": ("Сильный мокрый снег", "weather-snowy-rainy", "weather-snowy-rainy"),
+    "lightsleetshowers": ("Слабый мокрый снег", "weather-snowy-rainy",
+                          "weather-snowy-rainy"),
+    "sleetshowers": ("Мокрый снег", "weather-snowy-rainy", "weather-snowy-rainy"),
+    "heavysleetshowers": ("Сильный мокрый снег", "weather-snowy-rainy",
+                          "weather-snowy-rainy"),
+    "lightsleetandthunder": ("Слабый мокрый снег с грозой", "weather-lightning-rainy",
+                             "weather-lightning-rainy"),
+    "sleetandthunder": ("Мокрый снег с грозой", "weather-lightning-rainy",
+                        "weather-lightning-rainy"),
+    "heavysleetandthunder": ("Сильный мокрый снег с грозой", "weather-lightning-rainy",
+                             "weather-lightning-rainy"),
+    "sleetshowersandthunder": ("Мокрый снег с грозой", "weather-lightning-rainy",
+                               "weather-lightning-rainy"),
+    "heavysleetshowersandthunder": ("Сильный мокрый снег с грозой",
+                                    "weather-lightning-rainy",
+                                    "weather-lightning-rainy"),
+    # ВНИМАНИЕ: в API MET есть официальные символы с двойной «s» (опечатка
+    # в их коде, исправление отложено) — таблица содержит их дословно.
+    "lightssleetshowersandthunder": ("Слабый мокрый снег с грозой",
+                                     "weather-snowy-rainy", "weather-snowy-rainy"),
+    # Снег
+    "lightsnow": ("Небольшой снег", "weather-snowy", "weather-snowy"),
+    "snow": ("Снег", "weather-snowy", "weather-snowy"),
+    "heavysnow": ("Сильный снег", "weather-snowy-heavy", "weather-snowy-heavy"),
+    "lightsnowshowers": ("Небольшой снежный ливень", "weather-snowy", "weather-snowy"),
+    "snowshowers": ("Снежный ливень", "weather-snowy", "weather-snowy"),
+    "heavysnowshowers": ("Сильный снежный ливень", "weather-snowy-heavy",
+                         "weather-snowy-heavy"),
+    # Снег с грозой
+    "lightsnowandthunder": ("Небольшой снег с грозой", "weather-lightning-rainy",
+                            "weather-lightning-rainy"),
+    "snowandthunder": ("Снег с грозой", "weather-lightning-rainy",
+                       "weather-lightning-rainy"),
+    "heavysnowandthunder": ("Сильный снег с грозой", "weather-lightning-rainy",
+                            "weather-lightning-rainy"),
+    "lightsnowshowersandthunder": ("Небольшой снежный ливень с грозой",
+                                   "weather-lightning-rainy",
+                                   "weather-lightning-rainy"),
+    "snowshowersandthunder": ("Снежный ливень с грозой", "weather-lightning-rainy",
+                              "weather-lightning-rainy"),
+    "heavysnowshowersandthunder": ("Сильный снежный ливень с грозой",
+                                   "weather-lightning-rainy",
+                                   "weather-lightning-rainy"),
+    "lightssnowshowersandthunder": ("Небольшой снежный ливень с грозой",
+                                    "weather-snowy", "weather-snowy"),
+}
+
+
+def _met_symbol_heuristic(base):
+    """Неизвестный (новый) символ MET — вывод из его собственного имени.
+
+    Ничего не выдумывается: маркеры light/heavy/rain/snow/thunder берутся
+    из строки symbol_code, описание и иконка выводятся детерминированно.
+    """
+    if "thunder" in base:
+        icon = "weather-lightning-rainy"
+        noun = "Гроза"
+    elif "sleet" in base:
+        icon = "weather-snowy-rainy"
+        noun = "Мокрый снег"
+    elif "snow" in base:
+        icon = "weather-snowy-heavy" if "heavy" in base else "weather-snowy"
+        noun = "Снег"
+    elif "heavyrain" in base:
+        icon = "weather-pouring"
+        noun = "Сильный дождь"
+    elif "rain" in base:
+        icon = "weather-rainy"
+        noun = "Дождь"
+    elif "fog" in base:
+        icon = "weather-fog"
+        noun = "Туман"
+    elif "partlycloudy" in base:
+        icon = "weather-partly-cloudy"
+        noun = "Переменная облачность"
+    elif "cloudy" in base:
+        icon = "weather-cloudy"
+        noun = "Пасмурно"
+    elif "clearsky" in base or "fair" in base:
+        icon = "weather-sunny"
+        noun = "Ясно"
+    else:
+        icon = "weather-cloudy"
+        noun = "Переменная облачность"
+    if base.startswith("light") and "heavy" not in base:
+        noun = f"Небольшой {noun[0].lower()}{noun[1:]}" if noun[0].isupper() else noun
+    elif base.startswith("heavy") and not noun.startswith("Сильный"):
+        noun = f"Сильный {noun[0].lower()}{noun[1:]}"
+    return (noun, icon, icon)
+
+
+def weather_info(code, is_day=True):
+    """Код погоды -> (описание, имя иконки): MET symbol_code или legacy WMO.
+
+    У symbol_code есть варианты _day/_night/_polartwilight: ночная вариация
+    имеет приоритет над is_day. Для символов без суффикса (cloudy, fog,
+    rain...) берётся is_day (считается по восходу/закату места).
+    """
+    if isinstance(code, str) and code:
+        sym = code.strip().lower()
+        suffix = ""
+        base = sym
+        for suf in ("_polartwilight", "_polarday", "_day", "_night"):
+            if sym.endswith(suf):
+                suffix = suf[1:]
+                base = sym[:-len(suf)]
+                break
+        entry = MET_SYMBOL_BASES.get(base) or _met_symbol_heuristic(base)
+        desc, icon_day, icon_night = entry
+        if suffix == "night":
+            night = True
+        elif suffix in ("polartwilight", "polarday"):
+            # Полярные сумерки: яркость есть — ночью считаем только «ясно».
+            night = base in ("clearsky", "fair")
+        else:
+            night = not bool(is_day)
+        return desc, (icon_night if night else icon_day)
+    return wmo_info(code, is_day)
+
+
+def _sun_events(lat, lon, date_str, tzinfo=None):
+    """Восход/закат по NOAA-алгоритму (детерминированный расчёт, не данные
+    модели). Возвращает dict: sunrise/sunset — datetime в tzinfo (или None),
+    polar — "day" (полярный день) / "night" (полярная ночь) / None.
+    Проверено против официального MET Norway Sunrise API (расхождение ≤2 мин).
+    """
+    out = {"sunrise": None, "sunset": None, "polar": None}
+    try:
+        y, m, d = int(date_str[:4]), int(date_str[5:7]), int(date_str[8:10])
+        day0 = datetime(y, m, d, tzinfo=timezone.utc)
+    except Exception:
+        return out
+    doy = (day0 - datetime(y, 1, 1, tzinfo=timezone.utc)).days + 1
+    g = (2.0 * math.pi / 365.0) * (doy - 1 + 0.5)
+    eqtime = 229.18 * (0.000075 + 0.001868 * math.cos(g)
+                       - 0.032077 * math.sin(g) - 0.014615 * math.cos(2 * g)
+                       - 0.040849 * math.sin(2 * g))  # минуты
+    decl = (0.006918 - 0.399912 * math.cos(g) + 0.070257 * math.sin(g)
+            - 0.006758 * math.cos(2 * g) + 0.000907 * math.sin(2 * g)
+            - 0.002697 * math.cos(3 * g) + 0.00148 * math.sin(3 * g))  # радианы
+    try:
+        lat_r = math.radians(float(lat))
+        lon_e = float(lon)
+        cos_ha = (math.cos(math.radians(90.833))
+                  / (math.cos(lat_r) * math.cos(decl))
+                  - math.tan(lat_r) * math.tan(decl))
+    except Exception:
+        return out
+    if cos_ha > 1.0:
+        out["polar"] = "night"
+        return out
+    if cos_ha < -1.0:
+        out["polar"] = "day"
+        return out
+    ha_deg = math.degrees(math.acos(cos_ha))
+    # Солнечный полдень (UTC-минуты) = 720 - 4*lon_вост - eqtime;
+    # восход/закат = полдень -/+ 4*ha. Всё в UTC, локальное время — дальше.
+    sunrise_min = 720 - 4 * (lon_e + ha_deg) - eqtime
+    sunset_min = 720 - 4 * (lon_e - ha_deg) - eqtime
+    tz = tzinfo if tzinfo is not None else timezone.utc
+    out["sunrise"] = (day0 + timedelta(minutes=sunrise_min)).astimezone(tz)
+    out["sunset"] = (day0 + timedelta(minutes=sunset_min)).astimezone(tz)
+    return out
+
+
+def sun_times(lat, lon, date_str, tzinfo=None):
+    """(восход, закат) дня date_str в локальном формате "YYYY-MM-DDTHH:MM".
+
+    Полярный день/ночь -> (None, None); формат совместим с fmt_hhmm.
+    """
+    ev = _sun_events(lat, lon, date_str, tzinfo)
+    def iso(dt):
+        return dt.strftime("%Y-%m-%dT%H:%M") if dt is not None else None
+    return iso(ev["sunrise"]), iso(ev["sunset"])
 
 
 def _clean_part(s):
@@ -425,64 +783,318 @@ def _at(seq, i):
         return None
 
 
-def normalize_weather(data):
-    """Приводит ответ Open-Meteo к внутренней структуре, независимой от API."""
+def _met_period(entry, key):
+    """Блок периода (next_1/6/12_hours) или None."""
+    data = entry.get("data") if isinstance(entry, dict) else None
     if not isinstance(data, dict):
         return None
-    cur = data.get("current") or {}
-    daily = data.get("daily") or {}
-    if not isinstance(cur, dict):
-        cur = {}
-    if not isinstance(daily, dict):
-        daily = {}
-    dates = daily.get("time") or []
-    days = []
-    for i in range(len(dates)):
-        days.append(
-            {
-                "date": _at(dates, i),
-                "code": _at(daily.get("weather_code"), i),
-                "tmax": _at(daily.get("temperature_2m_max"), i),
-                "tmin": _at(daily.get("temperature_2m_min"), i),
-                "sunrise": _at(daily.get("sunrise"), i),
-                "sunset": _at(daily.get("sunset"), i),
-                "precip": _at(daily.get("precipitation_probability_max"), i),
-                "wind": _at(daily.get("wind_speed_10m_max"), i),
-            }
-        )
-    hourly = data.get("hourly") or {}
-    if not isinstance(hourly, dict):
-        hourly = {}
-    h_times = hourly.get("time") or []
+    block = data.get(key)
+    return block if isinstance(block, dict) else None
+
+
+def _met_entry_symbol(entry):
+    """Первый доступный symbol_code: next_1 -> next_6 -> next_12."""
+    for key in ("next_1_hours", "next_6_hours", "next_12_hours"):
+        block = _met_period(entry, key)
+        if block:
+            sym = (block.get("summary") or {}).get("symbol_code")
+            if isinstance(sym, str) and sym:
+                return sym
+    return None
+
+
+def _met_symbol_is_day(sym, dt_local, sun_ev):
+    """День/ночь для символа: суффикс приоритетен, иначе восход/закат."""
+    if isinstance(sym, str):
+        if sym.endswith("_night"):
+            return 0
+        if sym.endswith(("_day", "_polartwilight", "_polarday")):
+            return 1
+    if sun_ev.get("polar") == "day":
+        return 1
+    if sun_ev.get("polar") == "night":
+        return 0
+    sr, ss = sun_ev.get("sunrise"), sun_ev.get("sunset")
+    if sr is not None and ss is not None:
+        return 1 if sr <= dt_local < ss else 0
+    return 1
+
+
+def normalize_metno(raw, tz=None, lat=None, lon=None, now=None):
+    """Ответ MET Norway (locationforecast) -> внутренняя структура погоды.
+
+    Формат совместим с прежним пайплайном (current / hours / daily /
+    timezone / utc_offset_seconds), чтобы UI, кэш и фоновый путь не
+    менялись. tz — IANA-имя пояса места (из геокодера/кэша); если нет —
+    фиксированный сдвиг устройства. now — момент «сейчас» (для тестов).
+    Часы — локальное время места; суффикс symbol_code даёт день/ночь,
+    для символов без суффикса — восход/закат (расчёт NOAA, см. _sun_events).
+    Осадки дня — сумма next_1_hours (иначе next_6_hours) precipitation_amount
+    в МИЛЛИМЕТРАХ (у MET нет вероятности осадков для глобальной зоны —
+    проценты не подставляются). tmax/tmin — из почасовых значений и
+    next_6_hours (средний диапазон). Пустой/чужой формат -> None.
+    """
+    if not isinstance(raw, dict):
+        return None
+    series = (raw.get("properties") or {}).get("timeseries")
+    if not isinstance(series, list) or not series:
+        return None
+
+    tz_name = tz if isinstance(tz, str) and tz else None
+    tzinfo = None
+    if tz_name and ZoneInfo is not None:
+        try:
+            tzinfo = ZoneInfo(tz_name)
+        except Exception:
+            tzinfo = None
+    if tzinfo is None:
+        tzinfo = datetime.now().astimezone().tzinfo
+        tz_name = tz_name or "device"
+
+    now_utc = now if now is not None else datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+
+    entries = []
+    for e in series:
+        if not isinstance(e, dict):
+            continue
+        t = e.get("time")
+        if not isinstance(t, str) or len(t) < 20:
+            continue
+        try:
+            eu = datetime.fromisoformat(t.replace("Z", "+00:00"))
+            if eu.tzinfo is None:
+                eu = eu.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        entries.append((eu, eu.astimezone(tzinfo), e))
+    if not entries:
+        return None
+
+    # Кэш восхода/заката по датам места (нужен и для дня/ночи, и для UI).
+    sun_cache = {}
+
+    def sun_for(d_local):
+        key = d_local.date().isoformat()
+        if key not in sun_cache:
+            if lat is not None and lon is not None:
+                sun_cache[key] = _sun_events(lat, lon, key, tzinfo)
+            else:
+                sun_cache[key] = {"sunrise": None, "sunset": None, "polar": None}
+        return sun_cache[key]
+
+    # Текущий entry: последний с временем <= now (иначе первый — граница шага).
+    cur_eu, cur_el, cur_entry = entries[0]
+    for eu, el, e in entries:
+        if eu <= now_utc:
+            cur_eu, cur_el, cur_entry = eu, el, e
+        else:
+            break
+
     hours = []
-    for i in range(len(h_times)):
-        hours.append(
-            {
-                "time": _at(h_times, i),
-                "temp": _at(hourly.get("temperature_2m"), i),
-                "code": _at(hourly.get("weather_code"), i),
-                "is_day": _at(hourly.get("is_day"), i),
-                "feels": _at(hourly.get("apparent_temperature"), i),
-                "precip": _at(hourly.get("precipitation_probability"), i),
+    for eu, el, e in entries:
+        inst = ((e.get("data") or {}).get("instant") or {}).get("details") or {}
+        sym = _met_entry_symbol(e)
+        hours.append({
+            "time": el.strftime("%Y-%m-%dT%H:%M"),
+            "temp": inst.get("air_temperature"),
+            "code": sym,
+            "is_day": _met_symbol_is_day(sym, el, sun_for(el)),
+            "feels": inst.get("apparent_air_temperature"),
+            "precip": None,
+        })
+
+    cur_inst = ((cur_entry.get("data") or {}).get("instant")
+                or {}).get("details") or {}
+    cur_sym = _met_entry_symbol(cur_entry)
+    now_local = now_utc.astimezone(tzinfo)
+    current = {
+        "time": now_local.strftime("%Y-%m-%dT%H:%M:%S"),
+        "temp": cur_inst.get("air_temperature"),
+        "code": cur_sym,
+        "cloud_cover": cur_inst.get("cloud_area_fraction"),
+        "is_day": _met_symbol_is_day(cur_sym, now_local, sun_for(now_local)),
+        "feels": cur_inst.get("apparent_air_temperature"),
+        "humidity": cur_inst.get("relative_humidity"),
+        "wind_speed": cur_inst.get("wind_speed"),
+        "wind_dir": cur_inst.get("wind_from_direction"),
+        "wind_gust": cur_inst.get("wind_speed_of_gust"),
+    }
+
+    # --- Дни: группировка записей по локальной дате ---
+    days_map = {}
+
+    def day_bucket(d_local):
+        key = d_local.strftime("%Y-%m-%d")
+        if key not in days_map:
+            days_map[key] = {
+                "date": key, "temps": [], "winds": [],
+                "n6max": [], "n6min": [], "n1p": [], "n6p": [],
+                "entries": [],
             }
-        )
+        return days_map[key]
+
+    for eu, el, e in entries:
+        b = day_bucket(el)
+        inst = ((e.get("data") or {}).get("instant") or {}).get("details") or {}
+        t = inst.get("air_temperature")
+        if t is not None:
+            b["temps"].append(t)
+        w = inst.get("wind_speed")
+        if w is not None:
+            b["winds"].append(w)
+        n1 = _met_period(e, "next_1_hours")
+        if n1:
+            p = (n1.get("details") or {}).get("precipitation_amount")
+            if p is not None:
+                b["n1p"].append(p)
+        n6 = _met_period(e, "next_6_hours")
+        if n6:
+            det = n6.get("details") or {}
+            if det.get("air_temperature_max") is not None:
+                b["n6max"].append(det["air_temperature_max"])
+            if det.get("air_temperature_min") is not None:
+                b["n6min"].append(det["air_temperature_min"])
+            p = det.get("precipitation_amount")
+            if p is not None:
+                b["n6p"].append(p)
+        b["entries"].append((el, e))
+
+    # Глобальный список (время, символ) из всех периодов серии: хвост
+    # прогноза (только instant, без периодов) получает код из ближайшего
+    # entry — данные те же, ничего не выдумываем.
+    all_syms = []
+    for _, el, e in entries:
+        sym = _met_entry_symbol(e)
+        if sym:
+            all_syms.append((el, sym))
+
+    daily = []
+    for key in sorted(days_map.keys()):
+        b = days_map[key]
+        # Осадки: next_1 (почасовой, без наложения) — иначе next_6 (в
+        # среднем диапазоне окна не перекрываются). Ни того ни другого —
+        # None, в UI значение просто не показывается (без выдумок).
+        precip = None
+        if b["n1p"]:
+            precip = round(sum(b["n1p"]), 1)
+        elif b["n6p"]:
+            precip = round(sum(b["n6p"]), 1)
+        # Температура дня: почасовые значения + диапазоны next_6 (только
+        # там, где почасовых нет — средний диапазон, иначе было бы
+        # двойное считывание окон).
+        temps = list(b["temps"]) + (b["n6max"] if not b["n1p"] else []) \
+            + (b["n6min"] if not b["n1p"] else [])
+        tmax = max(temps) if temps else None
+        tmin = min(temps) if temps else None
+        wind = max(b["winds"]) if b["winds"] else None
+        # Описание дня: символ окна, покрывающего полдень места; иначе —
+        # ближайший к полдню символ из любых доступных периодов.
+        noon = None
+        try:
+            noon = datetime.strptime(key, "%Y-%m-%d").replace(
+                hour=12, tzinfo=tzinfo)
+        except Exception:
+            noon = None
+        code = None
+        if noon is not None:
+            best = None
+            for el, e in b["entries"]:
+                for pkey, hours_n in (("next_12_hours", 12), ("next_6_hours", 6),
+                                      ("next_1_hours", 1)):
+                    block = _met_period(e, pkey)
+                    if not block:
+                        continue
+                    sym = (block.get("summary") or {}).get("symbol_code")
+                    if not isinstance(sym, str) or not sym:
+                        continue
+                    if el <= noon < el + timedelta(hours=hours_n):
+                        best = sym
+                        break
+                if best:
+                    break
+            if best is None:
+                nearest = None
+                for el, e in b["entries"]:
+                    sym = _met_entry_symbol(e)
+                    if not sym:
+                        continue
+                    dist = abs((el - noon).total_seconds())
+                    if nearest is None or dist < nearest[0]:
+                        nearest = (dist, sym)
+                best = nearest[1] if nearest else None
+            if best is None and all_syms:
+                nearest = None
+                for el, sym in all_syms:
+                    dist = abs((el - noon).total_seconds())
+                    if nearest is None or dist < nearest[0]:
+                        nearest = (dist, sym)
+                best = nearest[1] if nearest else None
+            code = best
+        ev = sun_for(datetime.strptime(key, "%Y-%m-%d"))
+        sr_iso, ss_iso = (None, None)
+        if ev.get("sunrise") is not None:
+            sr_iso = ev["sunrise"].strftime("%Y-%m-%dT%H:%M")
+        if ev.get("sunset") is not None:
+            ss_iso = ev["sunset"].strftime("%Y-%m-%dT%H:%M")
+        daily.append({
+            "date": key,
+            "code": code,
+            "tmax": tmax,
+            "tmin": tmin,
+            "sunrise": sr_iso,
+            "sunset": ss_iso,
+            "precip": precip,
+            "wind": wind,
+        })
+
+    try:
+        offset = int(now_local.utcoffset().total_seconds())
+    except Exception:
+        offset = 0
     return {
-        "current": {
-            "time": cur.get("time"),
-            "temp": cur.get("temperature_2m"),
-            "code": cur.get("weather_code"),
-            "cloud_cover": cur.get("cloud_cover"),
-            "is_day": cur.get("is_day"),
-            "feels": cur.get("apparent_temperature"),
-            "humidity": cur.get("relative_humidity_2m"),
-            "wind_speed": cur.get("wind_speed_10m"),
-            "wind_dir": cur.get("wind_direction_10m"),
-            "wind_gust": cur.get("wind_gusts_10m"),
-        },
+        "current": current,
         "hours": hours,
-        "daily": days,
-        "timezone": data.get("timezone"),
-        "utc_offset_seconds": data.get("utc_offset_seconds"),
+        "daily": daily,
+        "timezone": tz_name,
+        "utc_offset_seconds": offset,
+    }
+
+
+def nominatim_result_to_geocode(item):
+    """Элемент ответа Nominatim search -> форма Open-Meteo geocoding.
+
+    Позволяет on_geocode_success принимать ОБА геокодера без дублирования
+    логики: {"latitude", "longitude", "name", "admin1", "timezone"}.
+    Неразборчивый ответ -> None («Город не найден»).
+    """
+    if not isinstance(item, dict):
+        return None
+    try:
+        lat = float(item.get("lat"))
+        lon = float(item.get("lon"))
+    except (TypeError, ValueError):
+        return None
+    address = item.get("address")
+    address = address if isinstance(address, dict) else {}
+    name = (item.get("name") or address.get("city") or address.get("town")
+            or address.get("village") or address.get("municipality")
+            or address.get("hamlet") or address.get("county")
+            or address.get("state"))
+    if not name and isinstance(item.get("display_name"), str):
+        name = item["display_name"].split(",")[0].strip()
+    if not name:
+        return None
+    admin = address.get("state") or address.get("county")
+    if isinstance(admin, str) and name and admin.lower() == name.lower():
+        admin = None
+    return {
+        "latitude": lat,
+        "longitude": lon,
+        "name": name,
+        "admin1": admin,
+        "timezone": item.get("timezone"),
     }
 
 
@@ -639,6 +1251,9 @@ def apply_weather_record(path, weather):
     new_record = {
         "coords": coords_full if isinstance(coords_full, dict) else {},
         "location_name": record.get("location_name") or "",
+        # Часовой пояс места переживает фоновое обновление (raw-ответ его
+        # не содержит — читается из прежнего записка).
+        "location_tz": record.get("location_tz"),
         "weather": weather,
         "last_success": pick_newer_success(old_ls, moment),
         "saved_at": datetime.now().strftime("%d.%m %H:%M"),
@@ -667,8 +1282,9 @@ def apply_weather_record(path, weather):
 def run_background_update(path=None, fetch=None):
     """Фоновое обновление погоды: без UI, без GPS, атомарная запись кэша.
 
-    Берёт последние подтверждённые координаты из кэш-файла, запрашивает
-    Open-Meteo и атомарно перезаписывает файл (write-if-newer: более новый
+    Берёт последние подтверждённые координаты (и часовой пояс места) из
+    кэш-файла, запрашивает MET Norway (locationforecast) с User-Agent
+    по ToS и атомарно перезаписывает файл (write-if-newer: более новый
     last_success не откатывается, город из кэша не трогаем). Успех -> True;
     любой отказ (нет файла/координат/сети/валидного ответа) -> False, файл
     НЕ меняется — время «Обновлено» в статусе не сдвигается без успеха.
@@ -697,14 +1313,16 @@ def run_background_update(path=None, fetch=None):
               f"{int((time.time() - t0) * 1000)}", flush=True)
         return False
     lat, lon = coords
-    url = OPEN_METEO_URL.format(lat=lat, lon=lon)
+    url = met_forecast_url(lat, lon)
+    tz = record.get("location_tz")
+    headers = {"User-Agent": MET_UA, "Accept": "application/json"}
     try:
-        _status, data = fetch(url, timeout=20.0)
+        _status, data = fetch(url, timeout=20.0, headers=headers)
     except Exception:
         print(f"[BG] update end ok=False reason=fetch-failed dur_ms="
               f"{int((time.time() - t0) * 1000)}", flush=True)
         return False
-    weather = normalize_weather(data)
+    weather = normalize_metno(data, tz=tz, lat=lat, lon=lon)
     ok = apply_weather_record(path, weather)
     print(f"[BG] update end ok={ok} dur_ms={int((time.time() - t0) * 1000)}",
           flush=True)
@@ -712,13 +1330,15 @@ def run_background_update(path=None, fetch=None):
 
 
 def consume_bg_raw(path=None):
-    """Принимает сырой ответ Open-Meteo, сохранённый фоновым Java-воркером.
+    """Принимает сырой ответ MET Norway, сохранённый фоновым Java-воркером.
 
-    WorkManager пишет wildvantage_bg_raw.json рядом с кэшем (атомарно);
-    здесь — normalize_weather + та же write-if-newer запись, что и у
-    run_background_update, только без сетевого запроса. Имя raw-файла
-    забирается атомарно (os.replace в *.proc), чтобы параллельный fetch
-    воркера не был съеден. Отказ/битый файл -> False, кэш не меняется.
+    WorkManager пишет wildvantage_bg_raw_v2.json рядом с кэшем (атомарно);
+    здесь — normalize_metno + та же write-if-newer запись, что и у
+    run_background_update, только без сетевого запроса. Часовой пояс и
+    координаты берутся из уже лежащего кэш-записа (raw — только тело
+    ответа). Имя raw-файла забирается атомарно (os.replace в *.proc),
+    чтобы параллельный fetch воркера не был съеден. Отказ/битый файл ->
+    False, кэш не меняется.
     """
     path = path or CACHE_FILE
     base = os.path.dirname(os.path.abspath(path))
@@ -737,7 +1357,18 @@ def consume_bg_raw(path=None):
             print(f"[BG] consume end ok=False reason=bad-raw epoch={int(time.time())}",
                   flush=True)
             return False
-        weather = normalize_weather(data)
+        tz, lat, lon = None, None, None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                record = json.load(f)
+            if isinstance(record, dict):
+                tz = record.get("location_tz")
+                coords = bg_valid_coords(record.get("coords"))
+                if coords is not None:
+                    lat, lon = coords
+        except Exception:
+            pass
+        weather = normalize_metno(data, tz=tz, lat=lat, lon=lon)
         ok = apply_weather_record(path, weather)
         print(f"[BG] consume end ok={ok} epoch={int(time.time())} dur_ms="
               f"{int((time.time() - t0) * 1000)}", flush=True)
@@ -1249,6 +1880,26 @@ MDScreen:
                     MDBoxLayout:
                         size_hint_x: 1
 
+                # Диагностика сети: DNS/DoH/MET/геокодеры — отчёт в диалоге
+                # (см. check_net_logic). Тот же центрирующий паттерн и та же
+                # фиксированная высота строки 48dp, что и у GPS-кнопки.
+                MDBoxLayout:
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: "48dp"
+                    MDBoxLayout:
+                        size_hint_x: 1
+                    MDFillRoundFlatButton:
+                        text: "ПРОВЕРИТЬ СЕТЬ"
+                        _min_width: "240dp"
+                        _min_height: "44dp"
+                        size_hint: None, None
+                        pos_hint: {"center_y": .5}
+                        md_bg_color: 0.25, 0.3, 0.35, 1
+                        on_release: app.check_net_logic()
+                    MDBoxLayout:
+                        size_hint_x: 1
+
             # Почасовая погода — ровно 24 карточки: текущий час + следующие 23 часа
             MDLabel:
                 id: hourly_label
@@ -1311,6 +1962,10 @@ class WildVantage(MDApp):
         self._fetch_inflight = False  # идёт живой запрос погоды (синк кэша ждёт)
         self._loc_name = ""
         self._loc_name_coords = ""    # ключ координат владельца текущего названия
+        self._loc_tz = None           # IANA-пояс места (из геокодера/кэша)
+        self._geocode_fb = False      # уже был резервный геокодер в этом поиске
+        self._net_check_busy = False  # идёт диагностика сети
+        self._net_dialog = None       # открытый диалог диагностики
         self._reset_gps_state()
         return Builder.load_string(KV)
 
@@ -1426,9 +2081,11 @@ class WildVantage(MDApp):
             return False
 
     def _safe_start(self, *args):
-        # Миграция кэша: старые файлы с прежним названием («Косино» и им подобным)
-        # удаляем, чтобы название не переживало эту версию.
-        for old in ("wildvantage_v2.json", "wildvantage_v3.json"):
+        # Миграция кэша: старые файлы прежних версий (имена/формат)
+        # удаляем — они несовместимы с MET-форматом v5.
+        for old in ("wildvantage_v2.json", "wildvantage_v3.json",
+                    "wildvantage_v4.json", "wildvantage_bg_raw.json",
+                    "wildvantage_bg_raw.json.proc"):
             try:
                 if os.path.exists(old):
                     os.remove(old)
@@ -1605,12 +2262,41 @@ class WildVantage(MDApp):
             self.load_cache(city_filter=city)
             return
         self._set_status("Поиск города...")
+        # Первично Nominatim (чужой CDN — работает и когда Open-Meteo
+        # недоступен); при ошибке — ровно один резервный запрос к
+        # Open-Meteo geocoding (см. _on_search_error).
+        self._geocode_fb = False
+        url = NOMINATIM_SEARCH_URL.format(q=urllib.parse.quote(city))
+        headers = {"User-Agent": NOMINATIM_UA, "Accept-Language": "ru"}
+        self._fetch(url, on_success=self.on_geocode_success,
+                    on_error=self._on_search_error, timeout=10, headers=headers)
+
+    def _on_search_error(self, _req, err):
+        self.log("search: nominatim error:", err)
+        if getattr(self, "_geocode_fb", False):
+            self.log("search: резервный геокодер недоступен:", err)
+            self.on_geocode_error(_req, err)
+            return
+        self._geocode_fb = True
+        try:
+            city = self.root.ids.city_input.text.strip()
+        except Exception:
+            city = ""
+        if not city:
+            self.on_geocode_error(_req, err)
+            return
         url = GEOCODE_URL.format(q=urllib.parse.quote(city))
-        self._fetch(url, on_success=self.on_geocode_success, on_error=self.on_geocode_error, timeout=10)
+        self._fetch(url, on_success=self.on_geocode_success,
+                    on_error=self.on_geocode_error, timeout=10)
 
     def on_geocode_success(self, _req, result):
-        results = result.get("results") if isinstance(result, dict) else None
-        if not results:
+        results = None
+        if isinstance(result, dict):
+            results = result.get("results")
+        elif isinstance(result, list) and result:
+            # Ответ Nominatim (jsonv2) — приводим к форме geocoding.
+            results = [nominatim_result_to_geocode(result[0])]
+        if not results or not results[0]:
             self._set_status("Город не найден")
             return
         top = results[0]
@@ -1620,11 +2306,16 @@ class WildVantage(MDApp):
         except Exception:
             self._set_status("Город не найден")
             return
+        # Часовой пояс места — для «Обновлено: HH:MM» и локальных часов
+        # прогноза (Nominatim его не отдаёт — не затираем已有 значение).
+        tz = top.get("timezone")
+        if isinstance(tz, str) and tz:
+            self._loc_tz = tz
         name = top.get("name") or "Населённый пункт"
         admin = top.get("admin1")
         if admin and admin.lower() != name.lower():
             name = f"{name}, {admin}"
-        self.log("geocode:", name, lat, lon)
+        self.log("geocode:", name, lat, lon, "tz=", getattr(self, "_loc_tz", None))
         self.start_update(lat, lon, source="search", display_name=name, timeout=15)
 
     def on_geocode_error(self, _req, err):
@@ -1662,6 +2353,58 @@ class WildVantage(MDApp):
             return bool(check_permission(Permission.ACCESS_FINE_LOCATION))
         except Exception:
             return True
+
+    def check_net_logic(self):
+        """Диагностика сети (кнопка «ПРОВЕРИТЬ СЕТЬ»): поток + отчёт.
+
+        net_diagnose чистая и синхронная — вся длительность (DNS/DoH/HTTP
+        пробы, до ~30 с в худшем случае) уходит в фоновый поток; результат
+        — MDDialog (ленивый импорт) и построчно в лог. Повторный запуск
+        во время диагностики игнорируется.
+        """
+        if getattr(self, "_net_check_busy", False):
+            return
+        self._net_check_busy = True
+        self._set_status("Диагностика сети…")
+
+        def worker():
+            try:
+                met_ok, lines = net_diagnose()
+            except Exception as e:
+                met_ok, lines = False, [f"Диагностика упала: {type(e).__name__}: {e}"]
+
+            def done(*_a):
+                self._net_check_busy = False
+                for line in lines:
+                    self.log("net-check:", line)
+                try:
+                    self._set_status(
+                        "Сеть: MET отвечает, VPN не требуется" if met_ok
+                        else "Сеть: MET не отвечает"
+                    )
+                except Exception:
+                    pass
+                try:
+                    from kivymd.uix.dialog import MDDialog
+                    if self._net_dialog is not None:
+                        try:
+                            self._net_dialog.dismiss()
+                        except Exception:
+                            pass
+                    self._net_dialog = MDDialog(
+                        title="Диагностика сети",
+                        text="\n".join(lines),
+                    )
+                    self._net_dialog.open()
+                except Exception as e:
+                    self._log_exc("net check dialog", e)
+
+            try:
+                Clock.schedule_once(done, 0)
+            except Exception:
+                done()
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def run_gps_logic(self):
         self._set_gps_status("Поиск спутников…")
@@ -1871,6 +2614,12 @@ class WildVantage(MDApp):
         def success(_req, result):
             if gen != self._gen:
                 return
+            # Часовой пояс места, если деплой Nominatim его отдаёт (обычно
+            # нет) — тогда часы прогноза берут пояс из устройства.
+            if isinstance(result, dict):
+                tz = result.get("timezone")
+                if isinstance(tz, str) and tz:
+                    self._loc_tz = tz
             address = result.get("address") if isinstance(result, dict) else None
             details = location_pick_details(address)
             self.log("geocode: GPS coords =", lat, lon)
@@ -1910,16 +2659,19 @@ class WildVantage(MDApp):
 
         self._fetch(url, on_success=success, on_error=error, timeout=12, headers=headers)
 
-    # --- ПОГОДА (Open-Meteo) ---
+    # --- ПОГОДА (MET Norway) ---
     def fetch_weather(self, lat, lon, gen, timeout=None):
-        url = OPEN_METEO_URL.format(lat=lat, lon=lon)
+        url = met_forecast_url(lat, lon)
+        # ToS MET: без идентифицирующего User-Agent — 403.
+        headers = {"User-Agent": MET_UA, "Accept": "application/json"}
         self.log("weather request coords:", lat, lon)
 
         def success(_req, result):
             if gen != self._gen:
                 return
             self._fetch_inflight = False
-            weather = normalize_weather(result)
+            weather = normalize_metno(result, tz=getattr(self, "_loc_tz", None),
+                                      lat=lat, lon=lon)
             if not weather or not weather.get("daily"):
                 self.log("weather: пустой ответ")
                 self.load_cache(
@@ -1934,7 +2686,7 @@ class WildVantage(MDApp):
             self._last_success = pick_newer_success(
                 getattr(self, "_last_success", None), success_moment(weather)
             )
-            self.log("weather: источник = Open-Meteo (API)")
+            self.log("weather: источник = MET Norway (API)")
             self.log(
                 "weather:",
                 "tz=", weather.get("timezone"),
@@ -1964,7 +2716,8 @@ class WildVantage(MDApp):
                 status_msg=net_error_text(err, "weather"),
             )
 
-        self._fetch(url, on_success=success, on_error=error, timeout=timeout)
+        self._fetch(url, on_success=success, on_error=error, timeout=timeout,
+                    headers=headers)
 
     # --- ОТОБРАЖЕНИЕ ---
     def process_weather(self, weather, coords=None, from_cache=False):
@@ -1979,7 +2732,7 @@ class WildVantage(MDApp):
             is_day = bool(int(cur.get("is_day", 1)))
         except Exception:
             pass
-        desc, icon = wmo_info(cur.get("code"), is_day)
+        desc, icon = weather_info(cur.get("code"), is_day)
         self.log("display: is_day=", is_day, "desc=", desc, "icon=", icon)
 
         try:
@@ -2064,7 +2817,7 @@ class WildVantage(MDApp):
             is_day = bool(int(h.get("is_day", 1)))
         except Exception:
             pass
-        _, icon = wmo_info(h.get("code"), is_day)
+        _, icon = weather_info(h.get("code"), is_day)
         box = MDBoxLayout(
             orientation="vertical",
             spacing="2dp",
@@ -2180,13 +2933,15 @@ class WildVantage(MDApp):
 
     def _build_forecast_item(self, forecast_list, day):
         code = day.get("code")
-        d_desc, d_icon = wmo_info(code, True)
+        d_desc, d_icon = weather_info(code, True)
         text = f"{fmt_ddmm(day.get('date'))}  |  {fmt_temp(day.get('tmax'))} / {fmt_temp(day.get('tmin'))}"
-        tertiary = "Осадки: --%"
+        tertiary = "Осадки: н/д"
         try:
             parts = []
             if day.get("precip") is not None:
-                parts.append(f"Осадки: {float(day['precip']):.0f}%")
+                # MET Norway отдаёт осадки в МИЛЛИМЕТРАХ (вероятности у него
+                # нет для глобальной зоны) — показываем сумму, не проценты.
+                parts.append(f"Осадки: {float(day['precip']):.1f} мм")
             if day.get("wind") is not None:
                 parts.append(f"Ветер: {float(day['wind']):.0f} м/с")
             if parts:
@@ -2214,9 +2969,17 @@ class WildVantage(MDApp):
     def _save_cache(self):
         if not self._last_weather or not self._last_coords:
             return
+        tz = getattr(self, "_loc_tz", None)
+        if not tz:
+            # normalize_metno знает пояс, только если передали из геокодера;
+            # "device" — это фиксированный сдвиг, его не сохраняем как IANA.
+            wtz = self._last_weather.get("timezone")
+            if isinstance(wtz, str) and wtz and wtz != "device":
+                tz = wtz
         record = {
             "coords": self._last_coords,
             "location_name": self._loc_name,
+            "location_tz": tz,
             "weather": self._last_weather,
             "last_success": getattr(self, "_last_success", None),
             "saved_at": datetime.now().strftime("%d.%m %H:%M"),
@@ -2298,6 +3061,12 @@ class WildVantage(MDApp):
         self._last_success = pick_newer_success(
             getattr(self, "_last_success", None), record.get("last_success")
         )
+        # Пояс места из кэша (первый запуск после геокодера/фона): чтобы
+        # «Обновлено HH:MM» и дальнейшие нормализации шли по IANA-поясу,
+        # а не по фиксированному сдвигу устройства.
+        rtz = record.get("location_tz")
+        if isinstance(rtz, str) and rtz and not getattr(self, "_loc_tz", None):
+            self._loc_tz = rtz
         fallback_iso = (weather.get("current") or {}).get("time")
 
         is_far = bool(requested) and self._coords_far(requested, coords)
