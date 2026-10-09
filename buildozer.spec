@@ -11,7 +11,7 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,json
 
 # Можно поднять при релизе
-version = 13.0.4
+version = 13.0.5
 
 # tzdata — IANA-пояса на Android (zoneinfo без системного tzdata):
 # часы прогноза и «Обновлено» считаются по поясу места.

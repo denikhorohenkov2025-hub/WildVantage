@@ -47,7 +47,7 @@ CACHE_FILE = "wildvantage_v5.json"
 # Сырой ответ MET Norway, который атомарно пишет фоновый Java-воркер
 # (WorkManager) рядом с кэшем; Python принимает его в consume_bg_raw.
 BG_RAW_FILE = "wildvantage_bg_raw_v2.json"
-APP_VERSION = "13.0.4"
+APP_VERSION = "13.0.5"
 NOMINATIM_UA = "WildVantage (Android weather app; contact: denikhorohenkov2025-hub)"
 # MET Norway требует идентифицирующий User-Agent (иначе 403): имя приложения
 # + версия + контакт. Запрещены generic-строки вроде okhttp/Dalvik/Java.
@@ -95,6 +95,27 @@ REVERSE_URL = (
     "https://nominatim.openstreetmap.org/reverse"
     "?format=jsonv2&lat={lat}&lon={lon}&zoom=18&addressdetails=1&accept-language=ru"
 )
+
+
+def normalize_search_query(q):
+    """Нормализация запроса поиска городов.
+
+    Кириллица сохраняется как есть (quote кодирует её в UTF-8);
+    ё -> е (Nominatim/OSM индексируют «Екатеринбург»); схлопываются
+    повторные пробелы; обрезаются кавычки/точки по краям.
+    """
+    if not isinstance(q, str):
+        return ""
+    s = q.replace("ё", "е").replace("Ё", "Е")
+    s = " ".join(s.split())
+    s = s.strip("'\".,;:\u201c\u201d").strip()
+    return " ".join(s.split())
+
+
+def geocode_query_url(template, city):
+    """URL геокодера: нормализация запроса + percent-encoding UTF-8."""
+    q = normalize_search_query(city)
+    return template.format(q=urllib.parse.quote(q, safe="", encoding="utf-8"))
 
 # --- СЕТЬ: классификация ошибок, устойчивость к сломанному IPv6 ---------------
 # Симптом с устройства: «с VPN работает, без VPN — Нет сети». Классическая причина —
@@ -635,6 +656,127 @@ def weather_info(code, is_day=True):
     return wmo_info(code, is_day)
 
 
+def _num(v):
+    """Число из значения API (None при мусоре/отсутствии)."""
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def meteo_index(current, hours):
+    """Ориентировочный индекс метеочувствительности (0..100).
+
+    Факторы (только то, что реально есть в ответе MET Norway — ничего не
+    додумывается): изменение давления за 3 ч (из часовых данных), низкое
+    давление, изменение температуры за 3 ч, влажность, ветер. Шкала
+    условная, НЕ медицинский прогноз. None — оценивать нечего.
+    Шкала: 0-30 Низкий, 31-60 Умеренный, 61-100 Высокий.
+    """
+    if not isinstance(current, dict):
+        return None
+    cur_p = _num(current.get("pressure"))
+    cur_t = _num(current.get("temp"))
+    cur_h = _num(current.get("humidity"))
+    cur_w = _num(current.get("wind_speed"))
+    p3 = t3 = None
+    cur_time = str(current.get("time") or "")[:16]
+    if cur_time and isinstance(hours, (list, tuple)):
+        want = None
+        try:
+            want = (datetime.strptime(cur_time, "%Y-%m-%dT%H:%M")
+                    - timedelta(hours=3))
+        except Exception:
+            want = None
+        if want is not None:
+            best = None
+            for h in hours:
+                if not isinstance(h, dict):
+                    continue
+                try:
+                    hdt = datetime.strptime(str(h.get("time") or "")[:16],
+                                            "%Y-%m-%dT%H:%M")
+                except Exception:
+                    continue
+                diff = abs((hdt - want).total_seconds())
+                if best is None or diff < best[0]:
+                    best = (diff, h)
+            # Ближайший к «3 ч назад» момент не дальше полутора часов.
+            if best is not None and best[0] <= 5400:
+                p3 = _num(best[1].get("pressure"))
+                t3 = _num(best[1].get("temp"))
+    dp = (cur_p - p3) if (cur_p is not None and p3 is not None) else None
+    dt = (cur_t - t3) if (cur_t is not None and t3 is not None) else None
+    score = 0
+    parts = []  # короткие подписи влиявших факторов
+    if dp is not None:
+        adp = abs(dp)
+        v = (0 if adp < 1.5 else 10 if adp < 3 else
+             20 if adp < 5 else 30 if adp < 8 else 40)
+        score += v
+        if v:
+            parts.append("изменение давления {:+.1f} гПа/3ч".format(dp))
+    if cur_p is not None and cur_p < 1000.0:
+        score += 10
+        parts.append("низкое давление")
+    if dt is not None:
+        adt = abs(dt)
+        v = 0 if adt < 1 else 5 if adt < 2 else 10 if adt < 4 else 15
+        score += v
+        if v:
+            parts.append("изменение температуры {:+.1f}\u00b0C/3ч".format(dt))
+    if cur_h is not None:
+        if cur_h >= 85:
+            v = 15
+            parts.append("высокая влажность")
+        elif cur_h >= 70:
+            v = 10
+            parts.append("влажность")
+        elif cur_h < 30:
+            v = 5
+            parts.append("низкая влажность")
+        else:
+            v = 0
+        score += v
+    if cur_w is not None:
+        v = (0 if cur_w < 3 else 5 if cur_w < 8 else
+             10 if cur_w < 12 else 15)
+        score += v
+        if v:
+            parts.append("ветер {:.1f} м/с".format(cur_w))
+    known = [x for x in (dp, dt, cur_h, cur_w, cur_p) if x is not None]
+    if not known:
+        return None
+    score = min(100, int(round(score)))
+    if score <= 30:
+        level = "низкий"
+    elif score <= 60:
+        level = "умеренный"
+    else:
+        level = "высокий"
+    label = {"низкий": "Низкий", "умеренный": "Умеренный",
+             "высокий": "Высокий"}[level]
+    parts.sort(key=len, reverse=True)
+    return {"score": score, "level": level, "label": label,
+            "parts": parts[:3]}
+
+
+def meteo_dialog_text(meteo):
+    """Пояснение к метеоиндексу — без медицинских утверждений."""
+    if not isinstance(meteo, dict):
+        return "Нет данных о погодных факторах для оценки."
+    parts = meteo.get("parts") or []
+    if parts:
+        lead = "Факторы: " + "; ".join(parts) + "."
+    else:
+        lead = "Значимых погодных факторов не выявлено (спокойная погода)."
+    return ("Оценка ориентировочная, не медицинский прогноз. "
+            "Индекс {}/100. {} Эти факторы могут влиять на самочувствие "
+            "метеочувствительных людей.".format(meteo.get("score"), lead))
+
+
 def _sun_events(lat, lon, date_str, tzinfo=None):
     """Восход/закат по NOAA-алгоритму (детерминированный расчёт, не данные
     модели). Возвращает dict: sunrise/sunset — datetime в tzinfo (или None),
@@ -903,6 +1045,7 @@ def normalize_metno(raw, tz=None, lat=None, lon=None, now=None):
             "is_day": _met_symbol_is_day(sym, el, sun_for(el)),
             "feels": inst.get("apparent_air_temperature"),
             "precip": None,
+            "pressure": inst.get("air_pressure_at_sea_level"),
         })
 
     cur_inst = ((cur_entry.get("data") or {}).get("instant")
@@ -920,6 +1063,7 @@ def normalize_metno(raw, tz=None, lat=None, lon=None, now=None):
         "wind_speed": cur_inst.get("wind_speed"),
         "wind_dir": cur_inst.get("wind_from_direction"),
         "wind_gust": cur_inst.get("wind_speed_of_gust"),
+        "pressure": cur_inst.get("air_pressure_at_sea_level"),
     }
 
     # --- Дни: группировка записей по локальной дате ---
@@ -1059,6 +1203,7 @@ def normalize_metno(raw, tz=None, lat=None, lon=None, now=None):
         "daily": daily,
         "timezone": tz_name,
         "utc_offset_seconds": offset,
+        "meteo": meteo_index(current, hours),
     }
 
 
@@ -1733,6 +1878,26 @@ MDScreen:
                                     theme_text_color: "Custom"
                                     text_color: 0.85, 1, 0.85, 1
 
+                # Метеоиндекс: компактный тап-блок под текущей погодой;
+                # пояснение открывается в диалоге (см. meteo_touch).
+                MDBoxLayout:
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: max(dp(26), self.minimum_height)
+                    padding: dp(8), 0
+                    MDLabel:
+                        id: meteoindex_label
+                        text: "\U0001F9E0 Метеоиндекс: н/д"
+                        font_size: "13sp"
+                        halign: "center"
+                        shorten: True
+                        size_hint_x: 1
+                        height: max(dp(24), self.texture_size[1] + dp(2))
+                        text_size: self.width, None
+                        theme_text_color: "Custom"
+                        text_color: 0.75, 0.85, 0.75, 1
+                        on_touch_down: app.meteo_touch(*args)
+
                 # Восход / Закат: подпись + время (время в отдельной строке — не разрывается)
                 MDBoxLayout:
                     orientation: 'horizontal'
@@ -2254,7 +2419,7 @@ class WildVantage(MDApp):
 
     # --- ПОИСК ГОРОДА ---
     def search_logic(self):
-        city = self.root.ids.city_input.text.strip()
+        city = normalize_search_query(self.root.ids.city_input.text)
         if not city:
             self._set_status("Введите город")
             return
@@ -2264,9 +2429,10 @@ class WildVantage(MDApp):
         self._set_status("Поиск города...")
         # Первично Nominatim (чужой CDN — работает и когда Open-Meteo
         # недоступен); при ошибке — ровно один резервный запрос к
-        # Open-Meteo geocoding (см. _on_search_error).
+        # Open-Meteo geocoding (см. _on_search_error). Кириллица
+        # percent-encoded в UTF-8, ё -> е — см. normalize_search_query.
         self._geocode_fb = False
-        url = NOMINATIM_SEARCH_URL.format(q=urllib.parse.quote(city))
+        url = geocode_query_url(NOMINATIM_SEARCH_URL, city)
         headers = {"User-Agent": NOMINATIM_UA, "Accept-Language": "ru"}
         self._fetch(url, on_success=self.on_geocode_success,
                     on_error=self._on_search_error, timeout=10, headers=headers)
@@ -2279,13 +2445,13 @@ class WildVantage(MDApp):
             return
         self._geocode_fb = True
         try:
-            city = self.root.ids.city_input.text.strip()
+            city = normalize_search_query(self.root.ids.city_input.text)
         except Exception:
             city = ""
         if not city:
             self.on_geocode_error(_req, err)
             return
-        url = GEOCODE_URL.format(q=urllib.parse.quote(city))
+        url = geocode_query_url(GEOCODE_URL, city)
         self._fetch(url, on_success=self.on_geocode_success,
                     on_error=self.on_geocode_error, timeout=10)
 
@@ -2586,8 +2752,11 @@ class WildVantage(MDApp):
             root.sunset_label.text = "--:--"
             root.current_desc_label.text = "Загрузка..."
             root.current_icon.icon = "update"
+            root.meteoindex_label.text = "\U0001F9E0 Метеоиндекс: н/д"
+            root.meteoindex_label.text_color = (0.75, 0.85, 0.75, 1)
         except Exception:
             pass
+        self._meteo_dialog_text = None
 
         if display_name:
             self._set_location_name(display_name)
@@ -2734,6 +2903,8 @@ class WildVantage(MDApp):
             pass
         desc, icon = weather_info(cur.get("code"), is_day)
         self.log("display: is_day=", is_day, "desc=", desc, "icon=", icon)
+        meteo = weather.get("meteo")
+        self._meteo_dialog_text = meteo_dialog_text(meteo)
 
         try:
             root = self.root.ids
@@ -2743,6 +2914,21 @@ class WildVantage(MDApp):
             root.feels_label.text = fmt_temp(cur.get("feels"))
             root.humidity_label.text = humidity_text(cur.get("humidity"))
             root.wind_label.text = wind_text(cur.get("wind_speed"))
+            try:
+                lbl = root.meteoindex_label
+                if isinstance(meteo, dict):
+                    lbl.text = "\U0001F9E0 Метеоиндекс: " + str(
+                        meteo.get("label") or "н/д")
+                    lbl.text_color = {
+                        "низкий": (0.4, 0.9, 0.5, 1),
+                        "умеренный": (1, 0.85, 0.3, 1),
+                        "высокий": (1, 0.55, 0.45, 1),
+                    }.get(meteo.get("level"), (0.75, 0.85, 0.75, 1))
+                else:
+                    lbl.text = "\U0001F9E0 Метеоиндекс: н/д"
+                    lbl.text_color = (0.75, 0.85, 0.75, 1)
+            except Exception:
+                pass
             if coords.get("lat") is not None and coords.get("lon") is not None:
                 self._set_coords_text(coords["lat"], coords["lon"], coords.get("accuracy"))
             if self._loc_name:
@@ -2773,6 +2959,33 @@ class WildVantage(MDApp):
                 updated_status_text(getattr(self, "_last_success", None),
                                     cur.get("time"))
             )
+
+    def meteo_touch(self, label, touch):
+        """Тап по блоку метеоиндекса -> пояснение (диалог)."""
+        try:
+            if label.collide_point(*touch.pos):
+                self.show_meteo_dialog()
+                return True
+        except Exception:
+            pass
+        return False
+
+    def show_meteo_dialog(self):
+        """Диалог с пояснением метеоиндекса (ленивый импорт KivyMD)."""
+        text = getattr(self, "_meteo_dialog_text", None)
+        if not text:
+            return
+        try:
+            if getattr(self, "_meteo_dialog", None) is not None:
+                self._meteo_dialog.dismiss()
+        except Exception:
+            pass
+        try:
+            from kivymd.uix.dialog import MDDialog
+            self._meteo_dialog = MDDialog(title="Метеоиндекс", text=text)
+            self._meteo_dialog.open()
+        except Exception as e:
+            self._log_exc("meteo dialog", e)
 
     def _fill_hours(self, hours, current_time=None):
         """Строит ленту «ПОЧАСОВАЯ ПОГОДА»: ровно 24 карточки.
