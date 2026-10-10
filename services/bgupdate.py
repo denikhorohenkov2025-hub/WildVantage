@@ -102,6 +102,12 @@ def install_ui_stubs():
     lab.MDLabel = _Widget
     lab.MDIcon = _Widget
     uix.label = lab
+    card = _mk("kivymd.uix.card")
+    card.MDCard = _Widget
+    uix.card = card
+    btn = _mk("kivymd.uix.button")
+    btn.MDIconButton = _Widget
+    uix.button = btn
     kivymd.uix = uix
     kivymd.app = app
 

@@ -19,6 +19,8 @@ from kivymd.uix.list import ThreeLineIconListItem, IconLeftWidget
 from kivymd.uix.boxlayout import MDBoxLayout
 from kivymd.uix.floatlayout import MDFloatLayout
 from kivymd.uix.label import MDLabel, MDIcon
+from kivymd.uix.card import MDCard
+from kivymd.uix.button import MDIconButton
 
 # Часовой пояс места (IANA): на Android нет системного tzdata — ставим
 # пакет tzdata в requirements; без него работаем с фиксированным сдвигом.
@@ -44,10 +46,15 @@ except Exception:
     RoundedRectangle = None
 
 CACHE_FILE = "wildvantage_v5.json"
+# Избранные города: локальный JSON (название, координаты, пояс, снимок
+# погоды для карточек экрана «Управление городами»). Без дублей.
+FAV_FILE = "wildvantage_favorites.json"
+# Радиус «это же город» для дублей и привязки снимка (~2 км).
+FAV_DUP_DIST = 0.02
 # Сырой ответ MET Norway, который атомарно пишет фоновый Java-воркер
 # (WorkManager) рядом с кэшем; Python принимает его в consume_bg_raw.
 BG_RAW_FILE = "wildvantage_bg_raw_v2.json"
-APP_VERSION = "13.0.5"
+APP_VERSION = "13.0.6"
 NOMINATIM_UA = "WildVantage (Android weather app; contact: denikhorohenkov2025-hub)"
 # MET Norway требует идентифицирующий User-Agent (иначе 403): имя приложения
 # + версия + контакт. Запрещены generic-строки вроде okhttp/Dalvik/Java.
@@ -1546,6 +1553,26 @@ def wind_text(value):
         return "-- м/с"
 
 
+def wind_kmh_text(value):
+    """Ветер в км/ч: м/с (единица MET Norway) × 3,6. Запятая — по-русски."""
+    try:
+        return f"{float(value) * 3.6:.1f}".replace(".", ",") + " км/ч"
+    except Exception:
+        return "-- км/ч"
+
+
+def wind_dual_text(value):
+    """Две единицы одновременно: «6 м/с (21,6 км/ч)».
+
+    Исходное значение MET (м/с) не изменяется — км/ч выводится
+    вычислением × 3,6 только для отображения.
+    """
+    try:
+        return f"{float(value):.0f} м/с ({wind_kmh_text(value)})"
+    except Exception:
+        return "-- м/с (-- км/ч)"
+
+
 def slice_hours(hours, current_iso, count=24):
     """Строгий срез UI-ленты: текущий локальный час + следующие count-1 часов.
 
@@ -1580,9 +1607,174 @@ def slice_hours(hours, current_iso, count=24):
     return hours[start:start + count]
 
 
+# --- ИЗБРАННЫЕ ГОРОДА (хранение и модель) ---
+def fav_key(lat, lon):
+    """Стабильный ключ города: координаты с точностью ~11 м."""
+    try:
+        return f"{float(lat):.4f},{float(lon):.4f}"
+    except Exception:
+        return f"{lat},{lon}"
+
+
+def fav_identity(name, region=None):
+    """Нормализованная «личность» города для дублей (ё/е, регистр, пробелы)."""
+    n = " ".join(normalize_search_query(str(name or "")).lower().split())
+    r = " ".join(normalize_search_query(str(region or "")).lower().split())
+    return f"{n}|{r}"
+
+
+def _fav_coords(item):
+    try:
+        return float(item["lat"]), float(item["lon"])
+    except Exception:
+        return None
+
+
+def coords_near(lat1, lon1, lat2, lon2, dist=FAV_DUP_DIST):
+    """Координаты ближе dist градусов (~dist×111 км) — считаем одним местом."""
+    try:
+        return abs(float(lat1) - float(lat2)) <= dist and \
+            abs(float(lon1) - float(lon2)) <= dist
+    except Exception:
+        return False
+
+
+def favorite_is_same(a, b):
+    """Один и тот же город: те же имя+регион ИЛИ почти те же координаты."""
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    if (a.get("name") or a.get("region")) and (b.get("name") or b.get("region")) \
+            and fav_identity(a.get("name"), a.get("region")) \
+            == fav_identity(b.get("name"), b.get("region")):
+        return True
+    ca, cb = _fav_coords(a), _fav_coords(b)
+    if ca and cb:
+        return coords_near(ca[0], ca[1], cb[0], cb[1])
+    return False
+
+
+def load_favorites(path):
+    """Список городов из JSON. Повреждение/отсутствие — пустой список."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        cities = data.get("cities") if isinstance(data, dict) else None
+        if isinstance(cities, list):
+            out = []
+            for c in cities:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("name") and c.get("lat") is not None and c.get("lon") is not None:
+                    c.setdefault("key", fav_key(c["lat"], c["lon"]))
+                    out.append(c)
+            return out
+    except Exception:
+        pass
+    return []
+
+
+def save_favorites(path, cities):
+    """Атомарная запись (temp + os.replace), как у погодного кэша."""
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"cities": list(cities or [])}, f, ensure_ascii=False)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def favorite_city_view(item):
+    """Данные карточки города (без сети): название, состояние, текущая
+    температура и min/max текущего дня из снимка погоды."""
+    w = item.get("weather") if isinstance(item.get("weather"), dict) else {}
+    cur = w.get("current") or {}
+    days = w.get("daily") or []
+    day = days[0] if days and isinstance(days[0], dict) else {}
+    is_day = True
+    try:
+        is_day = bool(int(cur.get("is_day", 1)))
+    except Exception:
+        pass
+    desc, icon = weather_info(cur.get("code"), is_day)
+    return {
+        "name": item.get("name") or "Город",
+        "temp": fmt_temp(cur.get("temp")) if cur.get("temp") is not None else "--°",
+        "tmin": fmt_temp(day.get("tmin")) if day.get("tmin") is not None else "--°",
+        "tmax": fmt_temp(day.get("tmax")) if day.get("tmax") is not None else "--°",
+        "desc": desc,
+        "icon": icon,
+        "has_data": cur.get("temp") is not None,
+    }
+
+
 KV = """
 MDScreen:
     md_bg_color: 0.05, 0.08, 0.05, 1
+
+    # Экран «Управление городами»: свёрнут (height 0), при открытии
+    # main_scroll гасится (opacity/disabled) — наложений нет.
+    # Объявлен ДО main_scroll: children[0] корня остаётся main_scroll.
+    MDBoxLayout:
+        id: cities_view
+        orientation: 'vertical'
+        size_hint_y: 0
+        height: 0
+        opacity: 0
+        disabled: True
+        padding: ["12dp", "12dp", "12dp", "12dp"]
+        spacing: "8dp"
+
+        MDBoxLayout:
+            orientation: 'horizontal'
+            size_hint_y: None
+            height: "48dp"
+            spacing: "4dp"
+            MDIconButton:
+                icon: "arrow-left"
+                size_hint_y: None
+                size_hint_x: None
+                size: "48dp", "48dp"
+                on_release: app.close_cities_screen()
+            MDLabel:
+                text: "Управление городами"
+                bold: True
+                font_size: "17sp"
+                shorten: True
+                halign: "left"
+                valign: "middle"
+                size_hint_x: 1
+                text_size: self.width, None
+                theme_text_color: "Custom"
+                text_color: 0.85, 1, 0.85, 1
+            MDIconButton:
+                icon: "plus"
+                size_hint_y: None
+                size_hint_x: None
+                size: "48dp", "48dp"
+                on_release: app.add_city_from_search()
+
+        MDScrollView:
+            id: cities_scroll
+            do_scroll_x: False
+            bar_width: "3dp"
+            MDBoxLayout:
+                id: cities_list
+                orientation: 'vertical'
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: "8dp"
 
     MDScrollView:
         id: main_scroll
@@ -1632,6 +1824,20 @@ MDScreen:
                     size_hint_x: None
                     size: "48dp", "48dp"
                     on_release: app.search_logic()
+                # Найденный город — в избранное (снимок погоды сохраняется)
+                MDIconButton:
+                    icon: "star-outline"
+                    size_hint_y: None
+                    size_hint_x: None
+                    size: "48dp", "48dp"
+                    on_release: app.add_current_to_favorites()
+                # Экран «Управление городами»
+                MDIconButton:
+                    icon: "city-variant"
+                    size_hint_y: None
+                    size_hint_x: None
+                    size: "48dp", "48dp"
+                    on_release: app.open_cities_screen()
 
             # Переключатель режима (фиксированная высота — не зависит от
             # minimum_height: children с size_hint_y дают в minimum 0)
@@ -1692,18 +1898,66 @@ MDScreen:
                     theme_text_color: "Custom"
                     text_color: 0.7, 0.9, 0.7, 1
 
-                MDLabel:
-                    id: main_temp
-                    text: "--°"
-                    halign: "center"
-                    font_size: "52sp"
-                    bold: True
+                # Температура: 8° / 5° — факт крупно, «ощущается» мельче
+                # (значения из MET complete: air_temperature / apparent).
+                MDBoxLayout:
+                    orientation: 'horizontal'
                     size_hint_y: None
-                    height: max(dp(66), self.texture_size[1] + dp(6))
-                    valign: "middle"
+                    height: max(dp(66), self.minimum_height)
+                    spacing: "4dp"
+                    MDBoxLayout:
+                        size_hint_x: 1
+                    MDLabel:
+                        id: main_temp
+                        text: "--°"
+                        halign: "center"
+                        font_size: "52sp"
+                        bold: True
+                        size_hint: None, None
+                        width: "130dp"
+                        height: max(dp(66), self.texture_size[1] + dp(6))
+                        text_size: self.width, None
+                        theme_text_color: "Custom"
+                        text_color: 0.95, 1, 0.95, 1
+                    MDLabel:
+                        id: temp_slash
+                        text: "/"
+                        halign: "center"
+                        font_size: "30sp"
+                        size_hint: None, None
+                        width: "26dp"
+                        height: max(dp(66), self.texture_size[1] + dp(6))
+                        text_size: self.width, None
+                        theme_text_color: "Custom"
+                        text_color: 0.7, 0.85, 0.7, 1
+                    MDLabel:
+                        id: feels_big
+                        text: "--°"
+                        halign: "center"
+                        font_size: "30sp"
+                        bold: True
+                        size_hint: None, None
+                        width: "80dp"
+                        height: max(dp(66), self.texture_size[1] + dp(6))
+                        text_size: self.width, None
+                        theme_text_color: "Custom"
+                        text_color: 0.8, 0.9, 0.8, 1
+                    MDBoxLayout:
+                        size_hint_x: 1
+
+                # Легенда: что за два числа (не путать с min/max дня —
+                # они показываются в 7-дневном прогнозе и в избранном).
+                MDLabel:
+                    id: temp_caption
+                    text: "Температура / Ощущается"
+                    halign: "center"
+                    font_size: "11sp"
+                    shorten: True
+                    size_hint_y: None
+                    height: max(dp(15), self.texture_size[1] + dp(2))
                     text_size: self.width, None
                     theme_text_color: "Custom"
-                    text_color: 0.95, 1, 0.95, 1
+                    text_color: 0.6, 0.75, 0.6, 1
 
                 # Состояние: иконка + описание (сразу после температуры)
                 MDBoxLayout:
@@ -1877,26 +2131,57 @@ MDScreen:
                                     text_size: self.width, None
                                     theme_text_color: "Custom"
                                     text_color: 0.85, 1, 0.85, 1
+                                MDLabel:
+                                    id: wind_kmh_label
+                                    text: "-- км/ч"
+                                    font_size: "10sp"
+                                    halign: "center"
+                                    shorten: True
+                                    size_hint: None, None
+                                    width: "66dp"
+                                    height: max(dp(13), self.texture_size[1] + dp(2))
+                                    text_size: self.width, None
+                                    theme_text_color: "Custom"
+                                    text_color: 0.65, 0.8, 0.65, 1
 
-                # Метеоиндекс: компактный тап-блок под текущей погодой;
-                # пояснение открывается в диалоге (см. meteo_touch).
+                # Метеоиндекс: компактный тап-блок (иконка MDI brain вместо
+                # emoji — эмодзи рисуется квадратиками на части устройств);
+                # цвет — по уровню, пояснение открывается в диалоге.
                 MDBoxLayout:
                     orientation: 'horizontal'
                     size_hint_y: None
                     height: max(dp(26), self.minimum_height)
                     padding: dp(8), 0
-                    MDLabel:
-                        id: meteoindex_label
-                        text: "\U0001F9E0 Метеоиндекс: н/д"
-                        font_size: "13sp"
-                        halign: "center"
-                        shorten: True
+                    MDBoxLayout:
                         size_hint_x: 1
-                        height: max(dp(24), self.texture_size[1] + dp(2))
-                        text_size: self.width, None
-                        theme_text_color: "Custom"
-                        text_color: 0.75, 0.85, 0.75, 1
+                    MDBoxLayout:
+                        id: meteoindex_row
+                        orientation: 'horizontal'
+                        size_hint: None, None
+                        width: "190dp"
+                        height: max(dp(24), self.minimum_height)
+                        spacing: "5dp"
                         on_touch_down: app.meteo_touch(*args)
+                        MDIcon:
+                            id: meteoindex_icon
+                            icon: "brain"
+                            font_size: "15sp"
+                            size_hint: None, None
+                            size: "16dp", "16dp"
+                            theme_text_color: "Custom"
+                            text_color: 0.75, 0.85, 0.75, 1
+                        MDLabel:
+                            id: meteoindex_label
+                            text: "Метеоиндекс: н/д"
+                            font_size: "13sp"
+                            halign: "left"
+                            shorten: True
+                            size_hint_x: 1
+                            text_size: self.width, None
+                            theme_text_color: "Custom"
+                            text_color: 0.75, 0.85, 0.75, 1
+                    MDBoxLayout:
+                        size_hint_x: 1
 
                 # Восход / Закат: подпись + время (время в отдельной строке — не разрывается)
                 MDBoxLayout:
@@ -2119,6 +2404,11 @@ class WildVantage(MDApp):
         self.theme_cls.primary_palette = "Green"
         self.theme_cls.primary_hue = "900"
         self.cache_file = CACHE_FILE
+        self.fav_file = FAV_FILE
+        self.favorites = load_favorites(self.fav_file)
+        self._cities_open = False          # экран «Управление городами» открыт
+        self._fav_refresh_active = False   # идёт фоновое освежение снимков
+        self._fav_refresh_queue = []
         self.is_wilderness = False
         self._gen = 0
         self._last_weather = None
@@ -2308,6 +2598,39 @@ class WildVantage(MDApp):
             self.root.ids.gps_status_label.text = text or ""
         except Exception:
             pass
+
+    def _set_id_text(self, root, wid, text):
+        """Запись text по id, если такой виджет есть (совместимость со
+        старыми тестовыми стабами и повреждённой разметкой — не падает)."""
+        try:
+            w = getattr(root, wid)
+        except Exception:
+            try:
+                w = root[wid]
+            except Exception:
+                return
+        try:
+            w.text = text
+        except Exception:
+            pass
+
+    def _set_id_icon(self, root, wid, icon, color=None):
+        try:
+            w = getattr(root, wid)
+        except Exception:
+            try:
+                w = root[wid]
+            except Exception:
+                return
+        try:
+            w.icon = icon
+        except Exception:
+            pass
+        if color is not None:
+            try:
+                w.text_color = color
+            except Exception:
+                pass
 
     # --- ПЕРЕКЛЮЧЕНИЕ РЕЖИМА ---
     def toggle_mode(self, instance, value):
@@ -2748,12 +3071,16 @@ class WildVantage(MDApp):
             root.feels_label.text = "--°"
             root.humidity_label.text = "--%"
             root.wind_label.text = "-- м/с"
+            self._set_id_text(root, "wind_kmh_label", "-- км/ч")
+            self._set_id_text(root, "feels_big", "--°")
             root.sunrise_label.text = "--:--"
             root.sunset_label.text = "--:--"
             root.current_desc_label.text = "Загрузка..."
             root.current_icon.icon = "update"
-            root.meteoindex_label.text = "\U0001F9E0 Метеоиндекс: н/д"
+            root.meteoindex_label.text = "Метеоиндекс: н/д"
             root.meteoindex_label.text_color = (0.75, 0.85, 0.75, 1)
+            self._set_id_icon(root, "meteoindex_icon", "brain",
+                               (0.75, 0.85, 0.75, 1))
         except Exception:
             pass
         self._meteo_dialog_text = None
@@ -2829,6 +3156,14 @@ class WildVantage(MDApp):
         self._fetch(url, on_success=success, on_error=error, timeout=12, headers=headers)
 
     # --- ПОГОДА (MET Norway) ---
+    def _snapshot_shown_for(self, lat, lon):
+        """На экране уже показаны данные ЭТИХ координат (снимок избранного):
+        ошибка сети не должна подменять их чужим глобальным кэшем."""
+        w = self._last_weather
+        c = self._last_coords or {}
+        return (isinstance(w, dict) and bool(w.get("daily"))
+                and coords_near(c.get("lat"), c.get("lon"), lat, lon))
+
     def fetch_weather(self, lat, lon, gen, timeout=None):
         url = met_forecast_url(lat, lon)
         # ToS MET: без идентифицирующего User-Agent — 403.
@@ -2843,6 +3178,9 @@ class WildVantage(MDApp):
                                       lat=lat, lon=lon)
             if not weather or not weather.get("daily"):
                 self.log("weather: пустой ответ")
+                if self._snapshot_shown_for(lat, lon):
+                    self._set_status("Сервис погоды недоступен (показаны сохранённые данные)")
+                    return
                 self.load_cache(
                     gen=gen,
                     show_err=True,
@@ -2878,6 +3216,10 @@ class WildVantage(MDApp):
                 return
             self._fetch_inflight = False
             self.log("weather error:", err)
+            if self._snapshot_shown_for(lat, lon):
+                self._set_status(
+                    net_error_text(err, "weather") + " (показаны сохранённые данные)")
+                return
             self.load_cache(
                 gen=gen,
                 show_err=True,
@@ -2914,10 +3256,13 @@ class WildVantage(MDApp):
             root.feels_label.text = fmt_temp(cur.get("feels"))
             root.humidity_label.text = humidity_text(cur.get("humidity"))
             root.wind_label.text = wind_text(cur.get("wind_speed"))
+            # Вторая единица ветра (км/ч = м/с × 3,6) и крупная «ощущается»
+            self._set_id_text(root, "wind_kmh_label", wind_kmh_text(cur.get("wind_speed")))
+            self._set_id_text(root, "feels_big", fmt_temp(cur.get("feels")))
             try:
                 lbl = root.meteoindex_label
                 if isinstance(meteo, dict):
-                    lbl.text = "\U0001F9E0 Метеоиндекс: " + str(
+                    lbl.text = "Метеоиндекс: " + str(
                         meteo.get("label") or "н/д")
                     lbl.text_color = {
                         "низкий": (0.4, 0.9, 0.5, 1),
@@ -2925,8 +3270,11 @@ class WildVantage(MDApp):
                         "высокий": (1, 0.55, 0.45, 1),
                     }.get(meteo.get("level"), (0.75, 0.85, 0.75, 1))
                 else:
-                    lbl.text = "\U0001F9E0 Метеоиндекс: н/д"
+                    lbl.text = "Метеоиндекс: н/д"
                     lbl.text_color = (0.75, 0.85, 0.75, 1)
+                # Иконка MDI brain; цвет — как у текста по уровню
+                self._set_id_icon(root, "meteoindex_icon", "brain",
+                                  getattr(lbl, "text_color", None))
             except Exception:
                 pass
             if coords.get("lat") is not None and coords.get("lon") is not None:
@@ -2936,6 +3284,13 @@ class WildVantage(MDApp):
             root.forecast_list.clear_widgets()
         except Exception:
             pass
+
+        if not from_cache:
+            # Снимок для карточки города в «Управлении городами»
+            try:
+                self._favorite_sync_weather(weather, coords)
+            except Exception as e:
+                self._log_exc("fav sync", e)
 
         self._fill_hours(
             slice_hours(weather.get("hours") or [], cur.get("time")),
@@ -2986,6 +3341,348 @@ class WildVantage(MDApp):
             self._meteo_dialog.open()
         except Exception as e:
             self._log_exc("meteo dialog", e)
+
+    # --- ЭКРАН «УПРАВЛЕНИЕ ГОРОДАМИ» ---
+    def open_cities_screen(self, *args):
+        """Полноэкранный список избранных (главный скролл гасится)."""
+        self._cities_open = True
+        try:
+            ids = self.root.ids
+            cv = ids.cities_view
+            cv.size_hint_y = 1
+            cv.opacity = 1
+            cv.disabled = False
+            ms = ids.main_scroll
+            ms.opacity = 0
+            ms.disabled = True
+        except Exception as e:
+            self._log_exc("open cities", e)
+        try:
+            self._render_cities_list()
+        except Exception as e:
+            self._log_exc("render cities", e)
+        try:
+            self._refresh_favorites_stale()
+        except Exception as e:
+            self._log_exc("fav refresh", e)
+
+    def close_cities_screen(self, *args):
+        self._cities_open = False
+        try:
+            ids = self.root.ids
+            cv = ids.cities_view
+            cv.size_hint_y = 0
+            cv.opacity = 0
+            cv.disabled = True
+            ms = ids.main_scroll
+            ms.opacity = 1
+            ms.disabled = False
+        except Exception as e:
+            self._log_exc("close cities", e)
+
+    def add_city_from_search(self, *args):
+        """Кнопка «+»: назад к поиску города, фокус в поле ввода."""
+        self.close_cities_screen()
+        try:
+            self.root.ids.city_input.focus = True
+        except Exception:
+            pass
+
+    def add_current_to_favorites(self, *args):
+        """★: сохранить город, который сейчас на экране (из поиска/GPS)."""
+        coords = self._last_coords or {}
+        lat, lon = coords.get("lat"), coords.get("lon")
+        if lat is None or lon is None or not self._loc_name:
+            self._set_status("Сначала найдите город")
+            return False
+        item, added = self.add_favorite(
+            name=self._loc_name, lat=lat, lon=lon,
+            timezone=getattr(self, "_loc_tz", None),
+            weather=self._last_weather,
+        )
+        if item is None:
+            self._set_status("Не удалось добавить город")
+            return False
+        self.log("fav:", "добавлен" if added else "уже был", item.get("name"))
+        self.open_cities_screen()
+        return added
+
+    def add_favorite(self, name=None, lat=None, lon=None, region=None,
+                     timezone=None, weather=None):
+        """Добавить город (без дублей: имя+регион или координаты ~2 км).
+        Повторное добавление освежает снимок погоды существующей записи.
+        Возвращает (item, added)."""
+        full = str(name or "").strip()
+        if not full or lat is None or lon is None:
+            return None, False
+        tz = timezone if isinstance(timezone, str) and timezone \
+            and timezone != "device" else None
+        item = {
+            "key": fav_key(lat, lon),
+            "name": full,
+            "region": region,
+            "lat": float(lat),
+            "lon": float(lon),
+            "timezone": tz,
+            "weather": weather if isinstance(weather, dict) else None,
+            "weather_at": int(time.time()) if isinstance(weather, dict) else None,
+            "added_at": int(time.time()),
+        }
+        for ex in getattr(self, "favorites", []) or []:
+            if favorite_is_same(ex, item):
+                # Не дублируем: освежаем снимок/пояс у существующего города
+                if isinstance(weather, dict) and weather.get("daily"):
+                    ex["weather"] = weather
+                    ex["weather_at"] = int(time.time())
+                if tz:
+                    ex["timezone"] = tz
+                save_favorites(self.fav_file, self.favorites)
+                return ex, False
+        if not hasattr(self, "favorites") or self.favorites is None:
+            self.favorites = []
+        self.favorites.append(item)
+        save_favorites(self.fav_file, self.favorites)
+        return item, True
+
+    def remove_favorite(self, key):
+        before = len(getattr(self, "favorites", []) or [])
+        self.favorites = [c for c in (self.favorites or [])
+                          if c.get("key") != key]
+        if len(self.favorites) != before:
+            save_favorites(self.fav_file, self.favorites)
+            self.log("fav: удалён", key)
+            if getattr(self, "_cities_open", False):
+                try:
+                    self._render_cities_list()
+                except Exception as e:
+                    self._log_exc("render after remove", e)
+            return True
+        return False
+
+    def select_favorite(self, key):
+        """Открыть погоду города: снимок сразу, затем свежий MET-запрос.
+        GPS не запускается; gen-guard start_update отбрасывает старые ответы
+        при быстром переключении между городами."""
+        item = None
+        for c in getattr(self, "favorites", []) or []:
+            if c.get("key") == key:
+                item = c
+                break
+        if item is None:
+            return False
+        lat, lon = item.get("lat"), item.get("lon")
+        if lat is None or lon is None:
+            return False
+        name = item.get("name") or "Город"
+        tz = item.get("timezone")
+        self._loc_tz = tz if isinstance(tz, str) and tz and tz != "device" else None
+        try:
+            self.close_cities_screen()
+        except Exception:
+            pass
+        # source="city": без GPS; display_name — без reverse-geocode (быстро)
+        self.start_update(lat, lon, source="city", display_name=name, timeout=15)
+        snap = item.get("weather")
+        if isinstance(snap, dict) and snap.get("daily"):
+            # Кэш города — на экран немедленно; свежий ответ придёт позже
+            self._last_weather = snap
+            self.process_weather(snap, {"lat": lat, "lon": lon}, from_cache=True)
+            self._set_status(f"Город «{name}»: показ из сохранённых, обновление…")
+        self.log("fav: выбран", name, lat, lon)
+        return True
+
+    def _render_cities_list(self):
+        """Карточки сохранённых городов (название, состояние, temp, min/max)."""
+        try:
+            lst = self.root.ids.cities_list
+        except Exception:
+            return
+        lst.clear_widgets()
+        cities = getattr(self, "favorites", []) or []
+        if not cities:
+            lst.add_widget(MDLabel(
+                text="Пока нет городов.\nНайдите город (★ — в избранное)",
+                halign="center", font_size="14sp", size_hint_y=None,
+                height="56dp", theme_text_color="Custom",
+                text_color=(0.6, 0.75, 0.6, 1),
+            ))
+            return
+        for item in cities:
+            try:
+                lst.add_widget(self._build_city_card(item))
+            except Exception as e:
+                self._log_exc("city card", e)
+
+    def _build_city_card(self, item):
+        v = favorite_city_view(item)
+        card = MDCard(
+            orientation="horizontal",
+            size_hint=(1, None),
+            padding=["12dp", "9dp", "6dp", "9dp"],
+            spacing="8dp",
+            radius=14,
+            elevation=0,
+            md_bg_color=(0.1, 0.15, 0.1, 1),
+            line_color=(0.2, 0.4, 0.2, 1),
+        )
+        card._fav_key = item.get("key")
+        card.add_widget(MDIcon(
+            icon=v["icon"], font_size="24sp", size_hint=(None, None),
+            size=("28dp", "28dp"), theme_text_color="Custom",
+            text_color=(0.85, 1, 0.85, 1), valign="middle",
+        ))
+        mid = MDBoxLayout(orientation="vertical", size_hint_x=1,
+                          spacing="1dp", padding=("0dp", "0dp", "0dp", "2dp"))
+        for txt, fs, bold, col in (
+            (v["name"], "14sp", True, (0.95, 1, 0.95, 1)),
+            (v["desc"], "12sp", False, (0.7, 0.88, 0.7, 1)),
+        ):
+            lbl = MDLabel(
+                text=txt, bold=bold, font_size=fs, halign="left",
+                shorten=True, size_hint_y=None,
+                theme_text_color="Custom", text_color=col,
+            )
+            lbl.height = max(dp(17), lbl.texture_size[1] + dp(2))
+            lbl.bind(texture_size=lambda inst, ts, floor=dp(17):
+                     setattr(inst, "height", max(floor, ts[1] + dp(2))))
+            mid.add_widget(lbl)
+        card.add_widget(mid)
+        right = MDBoxLayout(orientation="vertical", size_hint_x=None,
+                            width="64dp", spacing="1dp")
+        for txt, fs, bold, col, floor in (
+            (v["temp"], "18sp", True, (0.95, 1, 0.95, 1), dp(24)),
+            (f"{v['tmin']} / {v['tmax']}", "11sp", False,
+             (0.65, 0.82, 0.65, 1), dp(15)),
+        ):
+            lbl = MDLabel(
+                text=txt, bold=bold, font_size=fs, halign="right",
+                size_hint_y=None, theme_text_color="Custom", text_color=col,
+            )
+            lbl.height = max(floor, lbl.texture_size[1] + dp(2))
+            lbl.bind(texture_size=lambda inst, ts, f=floor:
+                     setattr(inst, "height", max(f, ts[1] + dp(2))))
+            right.add_widget(lbl)
+        card.add_widget(right)
+        trash = MDIconButton(
+            icon="trash-can-outline", size_hint=(None, None),
+            size=("40dp", "40dp"), pos_hint={"center_y": 0.5},
+        )
+        key = item.get("key")
+        trash.bind(on_release=lambda *a, k=key: self.remove_favorite(k))
+        card._trash = trash
+        card.add_widget(trash)
+        # Тап по карточке (без области корзины) — переключение на город
+        card.bind(on_touch_down=self._on_city_card_touch)
+        card.bind(on_touch_up=self._on_city_card_touch_up)
+        card.height = card.minimum_height
+        card.bind(minimum_height=lambda inst, mh: setattr(inst, "height", mh))
+        return card
+
+    def _on_city_card_touch(self, card, touch):
+        try:
+            if not card.collide_point(*touch.pos):
+                return
+            trash = getattr(card, "_trash", None)
+            if trash is not None and trash.collide_point(*touch.pos):
+                return
+            card._touch_start = (touch.x, touch.y)
+        except Exception:
+            pass
+
+    def _on_city_card_touch_up(self, card, touch):
+        try:
+            start = getattr(card, "_touch_start", None)
+            card._touch_start = None
+            if not start or not card.collide_point(*touch.pos):
+                return
+            trash = getattr(card, "_trash", None)
+            if trash is not None and trash.collide_point(*touch.pos):
+                return
+            # короткое нажатие без сдвига = выбор города (скролл не триггерит)
+            if abs(touch.x - start[0]) <= dp(20) and abs(touch.y - start[1]) <= dp(20):
+                key = getattr(card, "_fav_key", None)
+                if key:
+                    self.select_favorite(key)
+        except Exception as e:
+            self._log_exc("city card touch up", e)
+
+    def _favorite_sync_weather(self, weather, coords):
+        """Сохранить свежую погоду текущего города в его карточку избранного."""
+        if not isinstance(weather, dict) or not getattr(self, "favorites", None):
+            return
+        if not isinstance(coords, dict):
+            return
+        lat, lon = coords.get("lat"), coords.get("lon")
+        if lat is None or lon is None:
+            return
+        changed = False
+        for item in self.favorites:
+            if coords_near(item.get("lat"), item.get("lon"), lat, lon):
+                if item.get("weather") is not weather:
+                    item["weather"] = weather
+                    tz = weather.get("timezone")
+                    if isinstance(tz, str) and tz and tz != "device":
+                        item["timezone"] = tz
+                    item["weather_at"] = int(time.time())
+                    changed = True
+        if changed:
+            save_favorites(self.fav_file, self.favorites)
+
+    # Фоновое освежение снимков при открытии экрана: последовательно,
+    # с паузой (ToS MET ~300/24ч), только устаревшие (>10 мин) записи.
+    def _refresh_favorites_stale(self):
+        if getattr(self, "_fav_refresh_active", False):
+            return
+        now = time.time()
+        stale = [c for c in (getattr(self, "favorites", []) or [])
+                 if not isinstance(c.get("weather"), dict)
+                 or not c["weather"].get("daily")
+                 or float(c.get("weather_at") or 0) + 600 < now]
+        if not stale:
+            return
+        self._fav_refresh_active = True
+        self._fav_refresh_queue = list(stale)
+        self._fav_refresh_next()
+
+    def _schedule_fav_next(self, delay=1.5):
+        try:
+            Clock.schedule_once(self._fav_refresh_next, delay)
+        except Exception:
+            self._fav_refresh_next()
+
+    def _fav_refresh_next(self, *args):
+        queue = getattr(self, "_fav_refresh_queue", None)
+        if not queue or not getattr(self, "_cities_open", False):
+            self._fav_refresh_active = False
+            return
+        item = queue.pop(0)
+        lat, lon = item.get("lat"), item.get("lon")
+        if lat is None or lon is None:
+            self._schedule_fav_next(0.1)
+            return
+        url = met_forecast_url(lat, lon)
+        headers = {"User-Agent": MET_UA, "Accept": "application/json"}
+
+        def success(_req, result):
+            try:
+                w = normalize_metno(result, tz=item.get("timezone"),
+                                    lat=lat, lon=lon)
+                if isinstance(w, dict) and w.get("daily"):
+                    item["weather"] = w
+                    item["weather_at"] = int(time.time())
+                    save_favorites(self.fav_file, self.favorites)
+                    if getattr(self, "_cities_open", False):
+                        self._render_cities_list()
+            except Exception as e:
+                self._log_exc("fav refresh store", e)
+            self._schedule_fav_next(1.5)
+
+        def error(_req, err):
+            self.log("fav refresh error:", item.get("name"), err)
+            self._schedule_fav_next(1.5)
+
+        self._fetch(url, on_success=success, on_error=error,
+                    timeout=15, headers=headers)
 
     def _fill_hours(self, hours, current_time=None):
         """Строит ленту «ПОЧАСОВАЯ ПОГОДА»: ровно 24 карточки.
@@ -3145,29 +3842,56 @@ class WildVantage(MDApp):
                 self._log_exc("forecast item", e)
 
     def _build_forecast_item(self, forecast_list, day):
+        """Карточка дня: дата + max/min, состояние, осадки и ветер (м/с и
+        км/ч) отдельными строками — без обрезки текста на 320dp."""
         code = day.get("code")
         d_desc, d_icon = weather_info(code, True)
-        text = f"{fmt_ddmm(day.get('date'))}  |  {fmt_temp(day.get('tmax'))} / {fmt_temp(day.get('tmin'))}"
-        tertiary = "Осадки: н/д"
-        try:
-            parts = []
-            if day.get("precip") is not None:
-                # MET Norway отдаёт осадки в МИЛЛИМЕТРАХ (вероятности у него
-                # нет для глобальной зоны) — показываем сумму, не проценты.
-                parts.append(f"Осадки: {float(day['precip']):.1f} мм")
-            if day.get("wind") is not None:
-                parts.append(f"Ветер: {float(day['wind']):.0f} м/с")
-            if parts:
-                tertiary = " · ".join(parts)
-        except Exception:
-            pass
-        item = ThreeLineIconListItem(
-            text=text,
-            secondary_text=d_desc,
-            tertiary_text=tertiary,
+        text = (f"{fmt_ddmm(day.get('date'))}  |  "
+                f"{fmt_temp(day.get('tmax'))} / {fmt_temp(day.get('tmin'))}")
+        card = MDCard(
+            orientation="vertical",
+            size_hint=(1, None),
+            padding=["12dp", "7dp", "12dp", "7dp"],
+            spacing="1dp",
+            radius=12,
+            elevation=0,
+            md_bg_color=(0.09, 0.13, 0.09, 1),
+            line_color=(0.16, 0.3, 0.16, 1),
         )
-        item.add_widget(IconLeftWidget(icon=d_icon))
-        forecast_list.add_widget(item)
+        head = MDBoxLayout(orientation="horizontal", size_hint_y=None,
+                           height="26dp", spacing="8dp")
+        head.add_widget(MDIcon(
+            icon=d_icon, font_size="20sp", size_hint=(None, None),
+            size=("22dp", "22dp"), theme_text_color="Custom",
+            text_color=(0.85, 1, 0.85, 1), valign="middle",
+        ))
+        head.add_widget(MDLabel(
+            text=text, bold=True, font_size="14sp", halign="left",
+            shorten=True, size_hint_x=1, theme_text_color="Custom",
+            text_color=(0.95, 1, 0.95, 1),
+        ))
+        card.add_widget(head)
+        for txt, fs, col in (
+            (d_desc, "12sp", (0.75, 0.9, 0.75, 1)),
+            *([ (f"Осадки: {float(day['precip']):.1f} мм", "11sp",
+                 (0.65, 0.8, 0.65, 1)) ]
+              if day.get("precip") is not None else []),
+            *([ (f"Ветер: {wind_dual_text(day['wind'])}", "11sp",
+                 (0.65, 0.8, 0.65, 1)) ]
+              if day.get("wind") is not None else []),
+        ):
+            lbl = MDLabel(
+                text=txt, font_size=fs, halign="left", shorten=True,
+                size_hint_y=None, theme_text_color="Custom", text_color=col,
+            )
+            # высота = текстуре (+запас): строка не обрезается и не растёт
+            lbl.height = max(dp(15), lbl.texture_size[1] + dp(2))
+            lbl.bind(texture_size=lambda inst, ts, floor=dp(15):
+                     setattr(inst, "height", max(floor, ts[1] + dp(2))))
+            card.add_widget(lbl)
+        card.height = card.minimum_height
+        card.bind(minimum_height=lambda inst, mh: setattr(inst, "height", mh))
+        forecast_list.add_widget(card)
 
     # --- КЭШ ---
     def _read_cache_record(self):
