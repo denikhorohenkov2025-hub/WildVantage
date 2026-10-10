@@ -54,7 +54,7 @@ FAV_DUP_DIST = 0.02
 # Сырой ответ MET Norway, который атомарно пишет фоновый Java-воркер
 # (WorkManager) рядом с кэшем; Python принимает его в consume_bg_raw.
 BG_RAW_FILE = "wildvantage_bg_raw_v2.json"
-APP_VERSION = "13.0.6"
+APP_VERSION = "13.0.7"
 NOMINATIM_UA = "WildVantage (Android weather app; contact: denikhorohenkov2025-hub)"
 # MET Norway требует идентифицирующий User-Agent (иначе 403): имя приложения
 # + версия + контакт. Запрещены generic-строки вроде okhttp/Dalvik/Java.
@@ -1724,7 +1724,10 @@ MDScreen:
     md_bg_color: 0.05, 0.08, 0.05, 1
 
     # Экран «Управление городами»: свёрнут (height 0), при открытии
-    # main_scroll гасится (opacity/disabled) — наложений нет.
+    # main_scroll сворачивается в height 0 + гасится (opacity/disabled):
+    # disabled-ScrollView с полным ростом поглощает тапы
+    # (scrollview.py on_scroll_start: disabled+collide -> return True),
+    # из-за чего кнопки cities_view не нажимались.
     # Объявлен ДО main_scroll: children[0] корня остаётся main_scroll.
     MDBoxLayout:
         id: cities_view
@@ -3352,7 +3355,15 @@ class WildVantage(MDApp):
             cv.size_hint_y = 1
             cv.opacity = 1
             cv.disabled = False
+            # main_scroll объявлен в KV последним -> children[0] корня и
+            # первым получает тап. disabled-ScrollView с полным ростом
+            # ПОГЛОЩАЕТ касания (on_scroll_start -> return True при
+            # collide+disabled), из-за чего кнопки cities_view не нажимались.
+            # Сворачиваем его в height 0 — collide_point ложен, тап
+            # проходит к cities_view (проверено repro-тестом dispatch).
             ms = ids.main_scroll
+            ms.size_hint_y = 0
+            ms.height = 0
             ms.opacity = 0
             ms.disabled = True
         except Exception as e:
@@ -3375,6 +3386,7 @@ class WildVantage(MDApp):
             cv.opacity = 0
             cv.disabled = True
             ms = ids.main_scroll
+            ms.size_hint_y = 1
             ms.opacity = 1
             ms.disabled = False
         except Exception as e:

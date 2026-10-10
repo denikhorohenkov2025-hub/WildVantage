@@ -58,7 +58,7 @@ public class WeatherUpdateWorker extends Worker {
             "https://api.met.no/weatherapi/locationforecast/2.0/complete"
                     + "?lat=%s&lon=%s";
     private static final String MET_UA =
-            "WILDVANTAGE/13.0.6 (github.com/denikhorohenkov2025-hub/WildVantage)";
+            "WILDVANTAGE/13.0.7 (github.com/denikhorohenkov2025-hub/WildVantage)";
 
     public WeatherUpdateWorker(Context context, WorkerParameters params) {
         super(context, params);
