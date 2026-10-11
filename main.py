@@ -54,7 +54,7 @@ FAV_DUP_DIST = 0.02
 # Сырой ответ MET Norway, который атомарно пишет фоновый Java-воркер
 # (WorkManager) рядом с кэшем; Python принимает его в consume_bg_raw.
 BG_RAW_FILE = "wildvantage_bg_raw_v2.json"
-APP_VERSION = "13.0.7"
+APP_VERSION = "13.0.8"
 NOMINATIM_UA = "WildVantage (Android weather app; contact: denikhorohenkov2025-hub)"
 # MET Norway требует идентифицирующий User-Agent (иначе 403): имя приложения
 # + версия + контакт. Запрещены generic-строки вроде okhttp/Dalvik/Java.
@@ -1257,6 +1257,28 @@ def fmt_temp(value):
         return "--°"
 
 
+def today_daily(days, cur_time):
+    """Запись daily за текущие локальные сутки места.
+
+    days — daily из normalize_metno (даты в поясе города); cur_time —
+    current.time ("%Y-%m-%dT%H:%M:%S", локальное время места). Если запись
+    за текущую дату отсутствует (данных за сутки нет) — None: UI покажет
+    «--°», а не значения чужого дня.
+    """
+    if not isinstance(days, list) or not days:
+        return None
+    key = cur_time[:10] if isinstance(cur_time, str) and len(cur_time) >= 10 \
+        else None
+    for d in days:
+        if isinstance(d, dict) and key and d.get("date") == key:
+            return d
+    # Времени current нет (старый кэш) — берём первый день: MET отдаёт
+    # серию с текущего часа, days[0] — текущие сутки места.
+    if key is None and isinstance(days[0], dict):
+        return days[0]
+    return None
+
+
 def fmt_hhmm(iso):
     if isinstance(iso, str) and len(iso) >= 16 and "T" in iso:
         return iso[11:16]
@@ -1817,6 +1839,16 @@ MDScreen:
                     id: city_input
                     hint_text: "Введите город"
                     mode: "round"
+                    # Kivy 2.1+ (в т.ч. 2.2.1): input_type по умолчанию
+                    # 'null' — Android IME работает в ограниченном режиме
+                    # «generate key events» и не отдаёт составленные
+                    # символы (кириллица Gboard не набирается). Явно
+                    # просим текстовую клавиатуру. Фильтра символов нет:
+                    # нормализация ё -> е только перед запросом поиска.
+                    input_type: "text"
+                    input_filter: None
+                    keyboard_suggestions: True
+                    multiline: False
                     size_hint_y: None
                     height: "48dp"
                     helper_text_mode: "on_error"
@@ -1901,8 +1933,9 @@ MDScreen:
                     theme_text_color: "Custom"
                     text_color: 0.7, 0.9, 0.7, 1
 
-                # Температура: 8° / 5° — факт крупно, «ощущается» мельче
-                # (значения из MET complete: air_temperature / apparent).
+                # Температура дня: максимум крупно, минимум мельче
+                # (tmax/tmin из почасовых MET за текущие локальные сутки
+                # места — см. normalize_metno/today_daily).
                 MDBoxLayout:
                     orientation: 'horizontal'
                     size_hint_y: None
@@ -1934,7 +1967,7 @@ MDScreen:
                         theme_text_color: "Custom"
                         text_color: 0.7, 0.85, 0.7, 1
                     MDLabel:
-                        id: feels_big
+                        id: temp_min_big
                         text: "--°"
                         halign: "center"
                         font_size: "30sp"
@@ -1948,11 +1981,11 @@ MDScreen:
                     MDBoxLayout:
                         size_hint_x: 1
 
-                # Легенда: что за два числа (не путать с min/max дня —
-                # они показываются в 7-дневном прогнозе и в избранном).
+                # Легенда: два числа — максимум/минимум текущего дня
+                # («ощущается» показывается в блоке деталей ниже).
                 MDLabel:
                     id: temp_caption
-                    text: "Температура / Ощущается"
+                    text: "Максимальная / Минимальная"
                     halign: "center"
                     font_size: "11sp"
                     shorten: True
@@ -1961,6 +1994,20 @@ MDScreen:
                     text_size: self.width, None
                     theme_text_color: "Custom"
                     text_color: 0.6, 0.75, 0.6, 1
+
+                # Текущая температура — отдельной строкой от min/max дня.
+                MDLabel:
+                    id: now_temp_label
+                    text: "Сейчас: --°"
+                    halign: "center"
+                    font_size: "13sp"
+                    bold: True
+                    shorten: True
+                    size_hint_y: None
+                    height: max(dp(18), self.texture_size[1] + dp(2))
+                    text_size: self.width, None
+                    theme_text_color: "Custom"
+                    text_color: 0.85, 0.95, 0.85, 1
 
                 # Состояние: иконка + описание (сразу после температуры)
                 MDBoxLayout:
@@ -3075,7 +3122,8 @@ class WildVantage(MDApp):
             root.humidity_label.text = "--%"
             root.wind_label.text = "-- м/с"
             self._set_id_text(root, "wind_kmh_label", "-- км/ч")
-            self._set_id_text(root, "feels_big", "--°")
+            self._set_id_text(root, "temp_min_big", "--°")
+            self._set_id_text(root, "now_temp_label", "Сейчас: --°")
             root.sunrise_label.text = "--:--"
             root.sunset_label.text = "--:--"
             root.current_desc_label.text = "Загрузка..."
@@ -3253,15 +3301,24 @@ class WildVantage(MDApp):
 
         try:
             root = self.root.ids
-            root.main_temp.text = fmt_temp(cur.get("temp"))
+            # Крупная строка — максимум/минимум ТЕКУЩИХ локальных суток
+            # места из daily MET (не текущая/ощущаемая). При отсутствии
+            # данных за день — "--°", без выдуманных значений.
+            day = today_daily(days, cur.get("time"))
+            tmax = day.get("tmax") if day else None
+            tmin = day.get("tmin") if day else None
+            root.main_temp.text = fmt_temp(tmax)
             root.current_desc_label.text = desc
             root.current_icon.icon = icon
             root.feels_label.text = fmt_temp(cur.get("feels"))
             root.humidity_label.text = humidity_text(cur.get("humidity"))
             root.wind_label.text = wind_text(cur.get("wind_speed"))
-            # Вторая единица ветра (км/ч = м/с × 3,6) и крупная «ощущается»
+            # Вторая единица ветра (км/ч = м/с × 3,6), минимум дня и
+            # отдельная строка текущей температуры.
             self._set_id_text(root, "wind_kmh_label", wind_kmh_text(cur.get("wind_speed")))
-            self._set_id_text(root, "feels_big", fmt_temp(cur.get("feels")))
+            self._set_id_text(root, "temp_min_big", fmt_temp(tmin))
+            self._set_id_text(root, "now_temp_label",
+                              "Сейчас: " + fmt_temp(cur.get("temp")))
             try:
                 lbl = root.meteoindex_label
                 if isinstance(meteo, dict):
