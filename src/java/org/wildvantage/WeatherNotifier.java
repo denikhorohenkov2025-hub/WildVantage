@@ -102,7 +102,7 @@ public final class WeatherNotifier {
             SharedPreferences cooldown = context.getSharedPreferences(
                     PREFS, Context.MODE_PRIVATE);
             long nowEpoch = System.currentTimeMillis() / 1000L;
-            int hour = Calendar.getInstance().getTime().get(Calendar.HOUR_OF_DAY);
+            int hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
             boolean quiet = isQuiet(appDir, hour);
             List<Alert> toPost = new ArrayList<>();
             for (Alert a : alerts) {
