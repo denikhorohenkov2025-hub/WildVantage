@@ -11,7 +11,7 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,json
 
 # Можно поднять при релизе
-version = 13.0.8
+version = 13.0.9
 
 # tzdata — IANA-пояса на Android (zoneinfo без системного tzdata):
 # часы прогноза и «Обновлено» считаются по поясу места.
@@ -21,7 +21,7 @@ orientation = portrait
 
 fullscreen = 0
 
-android.permissions = INTERNET, ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION
+android.permissions = INTERNET, ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION, POST_NOTIFICATIONS
 
 android.api = 31
 
@@ -40,9 +40,13 @@ android.enable_androidx = True
 # Фоновое обновление погоды (~15 мин): WorkManager (unique periodic work)
 # ставит задачу при наличии сети; Java-воркер сам берёт координаты из кэша,
 # запрос MET Norway и атомарно пишет сырой ответ рядом с кэшем — Python
-# принимает его при открытии/раз в 60 секунд. Без foreground-сервиса и
-# уведомлений. Периодичность приблизительная (Doze откладывает до окон
-# активности) — это штатное поведение системы.
+# принимает его при открытии/раз в 60 секунд. После успешного fetch воркер
+# анализирует свежий ответ и шлёт погодные уведомления (дождь/снег/гроза/
+# ветер/скачки температуры/давления) через NotificationChannel — они
+# работают и при закрытом приложении. Без foreground-сервиса. Периодичность
+# приблизительная (Doze откладывает до окон активности) — штатно.
+# Настройки уведомлений — в wildvantage_notify.json (пишет Python UI,
+# читает воркер). POST_NOTIFICATIONS — для Android 13+.
 android.gradle_dependencies = androidx.work:work-runtime:2.7.1
 
 android.add_gradle_repositories = mavenCentral()

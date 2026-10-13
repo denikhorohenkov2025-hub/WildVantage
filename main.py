@@ -34,6 +34,19 @@ try:
     from plyer import gps
 except Exception:
     gps = None
+# Погодные уведомления: чистые правила (пороги зеркалятся Java-воркером).
+try:
+    from services.alerts import (load_settings, save_settings,
+                                 DEFAULT_SETTINGS)
+    _HAS_ALERTS = True
+except Exception:
+    _HAS_ALERTS = False
+    load_settings = None
+    save_settings = None
+    DEFAULT_SETTINGS = {
+        "enabled": False, "rain": True, "snow": True, "thunder": True,
+        "wind": True, "temperature": True, "pressure": True, "quiet": False,
+    }
 try:
     import certifi
 except Exception:
@@ -54,7 +67,11 @@ FAV_DUP_DIST = 0.02
 # Сырой ответ MET Norway, который атомарно пишет фоновый Java-воркер
 # (WorkManager) рядом с кэшем; Python принимает его в consume_bg_raw.
 BG_RAW_FILE = "wildvantage_bg_raw_v2.json"
-APP_VERSION = "13.0.8"
+# Настройки погодных уведомлений: локальный JSON; пишет Python UI, читает
+# фоновый Java-воркер (WeatherNotifier) для уведомлений при закрытом
+# приложении. Правила анализа — в services/alerts.py (зеркалятся Java).
+NOTIFY_SETTINGS_FILE = "wildvantage_notify.json"
+APP_VERSION = "13.0.9"
 NOMINATIM_UA = "WildVantage (Android weather app; contact: denikhorohenkov2025-hub)"
 # MET Norway требует идентифицирующий User-Agent (иначе 403): имя приложения
 # + версия + контакт. Запрещены generic-строки вроде okhttp/Dalvik/Java.
@@ -673,14 +690,64 @@ def _num(v):
         return None
 
 
-def meteo_index(current, hours):
-    """Ориентировочный индекс метеочувствительности (0..100).
+def _near_hour(hours, cur_time, ago_hours):
+    """(pressure, temp) ближайшей к (cur_time - ago_h) почасовой точки.
 
-    Факторы (только то, что реально есть в ответе MET Norway — ничего не
-    додумывается): изменение давления за 3 ч (из часовых данных), низкое
-    давление, изменение температуры за 3 ч, влажность, ветер. Шкала
-    условная, НЕ медицинский прогноз. None — оценивать нечего.
-    Шкала: 0-30 Низкий, 31-60 Умеренный, 61-100 Высокий.
+    Возвращает (None, None), если истории нет или ближайшая точка дальше
+    90 минут от искомого момента. Никаких выдуманных значений.
+    """
+    if not cur_time or not isinstance(hours, (list, tuple)):
+        return None, None
+    try:
+        want = datetime.strptime(cur_time[:16], "%Y-%m-%dT%H:%M") \
+            - timedelta(hours=ago_hours)
+    except Exception:
+        return None, None
+    best = None
+    for h in hours:
+        if not isinstance(h, dict):
+            continue
+        try:
+            hdt = datetime.strptime(str(h.get("time") or "")[:16],
+                                    "%Y-%m-%dT%H:%M")
+        except Exception:
+            continue
+        diff = abs((hdt - want).total_seconds())
+        if best is None or diff < best[0]:
+            best = (diff, h)
+    if best is not None and best[0] <= 5400:
+        return _num(best[1].get("pressure")), _num(best[1].get("temp"))
+    return None, None
+
+
+def _band(v, steps):
+    """Баллы по величине: steps = [(порог, баллы), ...] по нарастанию."""
+    out = 0
+    for thr, pts in steps:
+        if v >= thr:
+            out = pts
+    return out
+
+
+# Прозрачная система весов метеоиндекса: вклад каждого фактора описан в
+# meteo_index; максимальная раскладка порядка 100 (давление ≤45, погодные
+# события ~40, ветер/влажность ~20, комбинация +10% поверх). Все пороги
+# взяты из реальных метеокритериев (град. шкалы признаны MET Norway):
+def meteo_index(current, hours):
+    """Детальный ориентировочный индекс метеочувствительности (0..100).
+
+    Учитываются (только реальные данные MET Norway):
+      * давление: сдвиг за 3 ч и за 6 ч (резкие перепады), скорость сдвига,
+        низкое давление (<1000 / <980 гПа);
+      * температура: сдвиг за 3 ч и за 6 ч (похолодания/потепления),
+        экстремальная жара (>=30°C) и мороз (<=-25°C);
+      * влажность высокая (>=85) и низкая (<30);
+      * ветер (сильный >=9 м/с) и порывы (wind_gust >= ветер+5 м/с);
+      * комбинация >=3 активных факторов: +10% сверху.
+    Каждый фактор вносит обоснованный вклад; значение не выдумывается и
+    не завышается искусственно. Шкала: 0-30 Низкий / 31-60 Умеренный /
+    61-100 Высокий. None — данных недостаточно (НЕ считается по нулям).
+    Возвращает score, level, label, parts (факторы) и details (для диалога).
     """
     if not isinstance(current, dict):
         return None
@@ -688,74 +755,92 @@ def meteo_index(current, hours):
     cur_t = _num(current.get("temp"))
     cur_h = _num(current.get("humidity"))
     cur_w = _num(current.get("wind_speed"))
-    p3 = t3 = None
+    cur_g = _num(current.get("wind_gust"))
     cur_time = str(current.get("time") or "")[:16]
-    if cur_time and isinstance(hours, (list, tuple)):
-        want = None
-        try:
-            want = (datetime.strptime(cur_time, "%Y-%m-%dT%H:%M")
-                    - timedelta(hours=3))
-        except Exception:
-            want = None
-        if want is not None:
-            best = None
-            for h in hours:
-                if not isinstance(h, dict):
-                    continue
-                try:
-                    hdt = datetime.strptime(str(h.get("time") or "")[:16],
-                                            "%Y-%m-%dT%H:%M")
-                except Exception:
-                    continue
-                diff = abs((hdt - want).total_seconds())
-                if best is None or diff < best[0]:
-                    best = (diff, h)
-            # Ближайший к «3 ч назад» момент не дальше полутора часов.
-            if best is not None and best[0] <= 5400:
-                p3 = _num(best[1].get("pressure"))
-                t3 = _num(best[1].get("temp"))
-    dp = (cur_p - p3) if (cur_p is not None and p3 is not None) else None
-    dt = (cur_t - t3) if (cur_t is not None and t3 is not None) else None
-    score = 0
-    parts = []  # короткие подписи влиявших факторов
-    if dp is not None:
-        adp = abs(dp)
-        v = (0 if adp < 1.5 else 10 if adp < 3 else
-             20 if adp < 5 else 30 if adp < 8 else 40)
-        score += v
-        if v:
-            parts.append("изменение давления {:+.1f} гПа/3ч".format(dp))
-    if cur_p is not None and cur_p < 1000.0:
-        score += 10
-        parts.append("низкое давление")
-    if dt is not None:
-        adt = abs(dt)
-        v = 0 if adt < 1 else 5 if adt < 2 else 10 if adt < 4 else 15
-        score += v
-        if v:
-            parts.append("изменение температуры {:+.1f}\u00b0C/3ч".format(dt))
-    if cur_h is not None:
-        if cur_h >= 85:
-            v = 15
-            parts.append("высокая влажность")
-        elif cur_h >= 70:
-            v = 10
-            parts.append("влажность")
-        elif cur_h < 30:
-            v = 5
-            parts.append("низкая влажность")
-        else:
-            v = 0
-        score += v
-    if cur_w is not None:
-        v = (0 if cur_w < 3 else 5 if cur_w < 8 else
-             10 if cur_w < 12 else 15)
-        score += v
-        if v:
-            parts.append("ветер {:.1f} м/с".format(cur_w))
-    known = [x for x in (dp, dt, cur_h, cur_w, cur_p) if x is not None]
-    if not known:
+    p3, t3 = _near_hour(hours, cur_time, 3)
+    p6, t6 = _near_hour(hours, cur_time, 6)
+    dp3 = (cur_p - p3) if (cur_p is not None and p3 is not None) else None
+    dp6 = (cur_p - p6) if (cur_p is not None and p6 is not None) else None
+    dt3 = (cur_t - t3) if (cur_t is not None and t3 is not None) else None
+    dt6 = (cur_t - t6) if (cur_t is not None and t6 is not None) else None
+    if (cur_p is None and cur_t is None and cur_h is None and cur_w is None
+            and dp3 is None and dp6 is None and dt3 is None and dt6 is None):
         return None
+
+    score = 0
+    parts = []  # факторы, реально повлиявшие на оценку
+
+    # --- Атмосферное давление (макс. вклад ~45) ---
+    if dp3 is not None:
+        v = _band(abs(dp3), [(1.5, 6), (3, 12), (5, 20), (8, 30)])
+        direction = "падает" if dp3 < 0 else "растёт"
+        score += v
+        if v:
+            parts.append("давление {dir} {v:+.1f} гПа/3ч".format(
+                dir=direction, v=dp3))
+    if dp6 is not None and dp3 is not None:
+        # скорость изменения: сдвиг 6 ч заметно больше сдвига 3 ч
+        rate = abs(dp6) - abs(dp3)
+        if rate >= 6:
+            score += 8
+            parts.append("скорость изменения давления высокая")
+        elif rate >= 3:
+            score += 4
+    if cur_p is not None:
+        if cur_p < 980.0:
+            score += 12
+            parts.append("очень низкое давление")
+        elif cur_p < 1000.0:
+            score += 8
+            parts.append("низкое давление")
+
+    # --- Температура: сдвиги и события (вклад <=~30) ---
+    if dt3 is not None:
+        v = _band(abs(dt3), [(1.5, 4), (3, 8), (5, 14), (8, 20)])
+        score += v
+        if v:
+            eco = "похолодание" if dt3 < 0 else "потепление"
+            parts.append("резкое {e} за 3 ч ({t:+.1f}°C)".format(
+                e=eco, t=dt3))
+    if dt6 is not None and dt3 is not None:
+        rate_t = abs(dt6) - abs(dt3)
+        if rate_t >= 4:
+            score += 6
+            parts.append("термоскачок за 6 ч")
+    if cur_t is not None:
+        if cur_t <= -25.0:
+            score += 10
+            parts.append("сильный мороз (≤-25°C)")
+        elif cur_t >= 30.0:
+            score += 10
+            parts.append("экстремальная жара (≥30°C)")
+
+    # --- Влажность (вклад <=10) ---
+    if cur_h is not None:
+        if cur_h >= 85.0:
+            score += 10
+            parts.append("высокая влажность (≥85%)")
+        elif cur_h > 30.0:
+            pass
+        elif cur_h > 0.0:
+            score += 3
+            parts.append("низкая влажность (<30%)")
+
+    # --- Ветер и порывы (вклад <=~20) ---
+    if cur_w is not None:
+        v = _band(cur_w, [(9, 8), (12, 14), (15, 20)])
+        score += v
+        if v:
+            parts.append("сильный ветер {:.1f} м/с".format(cur_w))
+        if cur_g is not None and cur_g >= cur_w + 5.0:
+            score += 5
+            parts.append("порывы ветра до {:.1f} м/с".format(cur_g))
+
+    # --- Комбинация неблагоприятных факторов: +10% (не завышаем) ---
+    active = [p for p in parts if p]
+    if len(active) >= 3 and score >= 25:
+        score = int(round(score * 1.1))
+
     score = min(100, int(round(score)))
     if score <= 30:
         level = "низкий"
@@ -766,22 +851,77 @@ def meteo_index(current, hours):
     label = {"низкий": "Низкий", "умеренный": "Умеренный",
              "высокий": "Высокий"}[level]
     parts.sort(key=len, reverse=True)
-    return {"score": score, "level": level, "label": label,
-            "parts": parts[:3]}
+    return {
+        "score": score,
+        "level": level,
+        "label": label,
+        "parts": parts[:4],
+        "details": {
+            "pressure": cur_p, "dp3": dp3, "dp6": dp6,
+            "temp": cur_t, "dt3": dt3, "dt6": dt6,
+            "humidity": cur_h, "wind": cur_w, "gust": cur_g,
+        },
+        "weights": {
+            "pressure_3h": 30, "pressure_6h_rate": 8,
+            "low_pressure": 12, "temp_3h": 20, "temp_6h_rate": 6,
+            "heat_or_frost": 10, "humidity": 10, "wind": 20,
+            "gust": 5, "combo": 1.1,
+        },
+    }
+
+
+def _dlg_fmt(value, fmt=".1f", unit=""):
+    """Форматирование для диалога: None -> «нет данных»."""
+    if value is None:
+        return "нет данных"
+    try:
+        return "{:+.1f}{}".format(float(value), unit)
+    except Exception:
+        return "нет данных"
 
 
 def meteo_dialog_text(meteo):
-    """Пояснение к метеоиндексу — без медицинских утверждений."""
+    """Подробное пояснение: итоговый индекс, уровень и факторы."""
     if not isinstance(meteo, dict):
-        return "Нет данных о погодных факторах для оценки."
+        return ("Метеоиндекс: недостаточно данных.\n"
+                "Оценка ориентировочная, не медицинский прогноз.")
+    d = meteo.get("details") or {}
+    score = meteo.get("score")
+    label = meteo.get("label")
+    lines = ["Индекс: {}/100 — уровень «{}».".format(
+        score, label if label else "н/д"), ""]
+    p = d.get("pressure")
+    if p is not None:
+        lines.append("Атмосферное давление: {:.0f} гПа (за 3 ч {:+.1f} гПа, "
+                     "за 6 ч {:+.1f} гПа).".format(p,
+                                                   d.get("dp3") or 0.0,
+                                                   d.get("dp6") or 0.0))
+    t = d.get("temp")
+    if t is not None:
+        lines.append("Температура: {:+.0f}°C (за 3 ч {:+.1f}°, за 6 ч "
+                     "{:+.1f}°).".format(t, d.get("dt3") or 0.0,
+                                         d.get("dt6") or 0.0))
+    h = d.get("humidity")
+    if h is not None:
+        lines.append("Влажность: {:.0f}%.".format(h))
+    w = d.get("wind")
+    if w is not None:
+        gust = d.get("gust")
+        gust_txt = ", порывы до {:.1f} м/с".format(gust) \
+            if gust is not None else ""
+        lines.append("Ветер: {:.1f} м/с{}.".format(w, gust_txt))
     parts = meteo.get("parts") or []
     if parts:
-        lead = "Факторы: " + "; ".join(parts) + "."
+        lines.append("")
+        lines.append("Основные факторы: " + "; ".join(parts) + ".")
     else:
-        lead = "Значимых погодных факторов не выявлено (спокойная погода)."
-    return ("Оценка ориентировочная, не медицинский прогноз. "
-            "Индекс {}/100. {} Эти факторы могут влиять на самочувствие "
-            "метеочувствительных людей.".format(meteo.get("score"), lead))
+        lines.append("")
+        lines.append("Значимых погодных факторов не выявлено (спокойная "
+                     "погода).")
+    lines.append("")
+    lines.append("Оценка ориентировочная и не является медицинским "
+                 "прогнозом. Не учитывает индивидуальное самочувствие.")
+    return "\n".join(lines)
 
 
 def _sun_events(lat, lon, date_str, tzinfo=None):
@@ -1053,6 +1193,10 @@ def normalize_metno(raw, tz=None, lat=None, lon=None, now=None):
             "feels": inst.get("apparent_air_temperature"),
             "precip": None,
             "pressure": inst.get("air_pressure_at_sea_level"),
+            "humidity": inst.get("relative_humidity"),
+            "wind_speed": inst.get("wind_speed"),
+            "wind_dir": inst.get("wind_from_direction"),
+            "wind_gust": inst.get("wind_speed_of_gust"),
         })
 
     cur_inst = ((cur_entry.get("data") or {}).get("instant")
@@ -1741,6 +1885,54 @@ def favorite_city_view(item):
     }
 
 
+def gps_location_view(state):
+    """Данные GPS-карточки в «Управлении городами» (без сети).
+
+    state — снимок текущего состояния: coords (последние подтверждённые
+    координаты), weather (последний ответ/кэш), loc_name. Без координат
+    возвращается «Местоположение недоступно» — ничего не выдумывается.
+    координаты местами не подменяются (карточка НЕ сохраняется в избранное).
+    """
+    coords = state.get("coords") or {}
+    loc_name = state.get("loc_name") or "Текущее местоположение"
+    has_coords = bool(coords.get("lat") is not None
+                      and coords.get("lon") is not None)
+    if not has_coords:
+        return {
+            "name": loc_name,
+            "temp": "--°",
+            "tmin": "--°",
+            "tmax": "--°",
+            "desc": "Местоположение недоступно",
+            "icon": "map-marker-off",
+            "has_data": False,
+            "has_coords": False,
+        }
+    w = state.get("weather") if isinstance(state.get("weather"), dict) else {}
+    cur = w.get("current") or {}
+    days = w.get("daily") or []
+    day = days[0] if days and isinstance(days[0], dict) else {}
+    is_day = True
+    try:
+        is_day = bool(int(cur.get("is_day", 1)))
+    except Exception:
+        pass
+    desc, icon = weather_info(cur.get("code"), is_day)
+    has_data = cur.get("temp") is not None
+    return {
+        "name": loc_name,
+        "temp": fmt_temp(cur.get("temp")) if has_data else "--°",
+        "tmin": (fmt_temp(day.get("tmin")) if day.get("tmin") is not None
+                 else "--°"),
+        "tmax": (fmt_temp(day.get("tmax")) if day.get("tmax") is not None
+                 else "--°"),
+        "desc": desc if has_data else "Нет данных",
+        "icon": icon if has_data else "map-marker-question",
+        "has_data": has_data,
+        "has_coords": True,
+    }
+
+
 KV = """
 MDScreen:
     md_bg_color: 0.05, 0.08, 0.05, 1
@@ -2400,6 +2592,181 @@ MDScreen:
                     MDBoxLayout:
                         size_hint_x: 1
 
+            # Погодные уведомления (настройки)
+            MDCard:
+                orientation: 'vertical'
+                size_hint_y: None
+                height: self.minimum_height
+                padding: ["16dp", "12dp", "16dp", "12dp"]
+                spacing: "4dp"
+                radius: 18
+                elevation: 0
+                md_bg_color: 0.1, 0.14, 0.1, 1
+                line_color: 0.25, 0.45, 0.25, 1
+
+                MDLabel:
+                    text: "ПОГОДНЫЕ УВЕДОМЛЕНИЯ"
+                    bold: True
+                    font_size: "14sp"
+                    size_hint_y: None
+                    height: max(dp(20), self.texture_size[1] + dp(4))
+                    theme_text_color: "Custom"
+                    text_color: 0.7, 0.95, 0.7, 1
+
+                MDBoxLayout:
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: "40dp"
+                    spacing: "6dp"
+                    MDLabel:
+                        text: "Включить уведомления"
+                        halign: "left"
+                        valign: "middle"
+                        size_hint_x: 1
+                        font_size: "13sp"
+                        theme_text_color: "Custom"
+                        text_color: 0.85, 1, 0.85, 1
+                    MDSwitch:
+                        id: notify_master
+                        active: False
+                        on_active: app.set_notify_setting('enabled', args[1])
+
+                MDBoxLayout:
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: "36dp"
+                    spacing: "6dp"
+                    MDLabel:
+                        text: "Дождь"
+                        halign: "left"
+                        valign: "middle"
+                        size_hint_x: 1
+                        font_size: "13sp"
+                        theme_text_color: "Custom"
+                        text_color: 0.8, 0.92, 0.8, 1
+                    MDSwitch:
+                        id: notify_rain
+                        active: True
+                        on_active: app.set_notify_setting('rain', args[1])
+
+                MDBoxLayout:
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: "36dp"
+                    spacing: "6dp"
+                    MDLabel:
+                        text: "Снегопад"
+                        halign: "left"
+                        valign: "middle"
+                        size_hint_x: 1
+                        font_size: "13sp"
+                        theme_text_color: "Custom"
+                        text_color: 0.8, 0.92, 0.8, 1
+                    MDSwitch:
+                        id: notify_snow
+                        active: True
+                        on_active: app.set_notify_setting('snow', args[1])
+
+                MDBoxLayout:
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: "36dp"
+                    spacing: "6dp"
+                    MDLabel:
+                        text: "Гроза"
+                        halign: "left"
+                        valign: "middle"
+                        size_hint_x: 1
+                        font_size: "13sp"
+                        theme_text_color: "Custom"
+                        text_color: 0.8, 0.92, 0.8, 1
+                    MDSwitch:
+                        id: notify_thunder
+                        active: True
+                        on_active: app.set_notify_setting('thunder', args[1])
+
+                MDBoxLayout:
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: "36dp"
+                    spacing: "6dp"
+                    MDLabel:
+                        text: "Ветер"
+                        halign: "left"
+                        valign: "middle"
+                        size_hint_x: 1
+                        font_size: "13sp"
+                        theme_text_color: "Custom"
+                        text_color: 0.8, 0.92, 0.8, 1
+                    MDSwitch:
+                        id: notify_wind
+                        active: True
+                        on_active: app.set_notify_setting('wind', args[1])
+
+                MDBoxLayout:
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: "36dp"
+                    spacing: "6dp"
+                    MDLabel:
+                        text: "Температура (жара/мороз/скачки)"
+                        halign: "left"
+                        valign: "middle"
+                        size_hint_x: 1
+                        font_size: "13sp"
+                        theme_text_color: "Custom"
+                        text_color: 0.8, 0.92, 0.8, 1
+                    MDSwitch:
+                        id: notify_temperature
+                        active: True
+                        on_active: app.set_notify_setting('temperature', args[1])
+
+                MDBoxLayout:
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: "36dp"
+                    spacing: "6dp"
+                    MDLabel:
+                        text: "Перепад давления"
+                        halign: "left"
+                        valign: "middle"
+                        size_hint_x: 1
+                        font_size: "13sp"
+                        theme_text_color: "Custom"
+                        text_color: 0.8, 0.92, 0.8, 1
+                    MDSwitch:
+                        id: notify_pressure
+                        active: True
+                        on_active: app.set_notify_setting('pressure', args[1])
+
+                MDBoxLayout:
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: "36dp"
+                    spacing: "6dp"
+                    MDLabel:
+                        text: "Тихий режим (ночь — только критичное)"
+                        halign: "left"
+                        valign: "middle"
+                        size_hint_x: 1
+                        font_size: "13sp"
+                        theme_text_color: "Custom"
+                        text_color: 0.8, 0.92, 0.8, 1
+                    MDSwitch:
+                        id: notify_quiet
+                        active: False
+                        on_active: app.set_notify_setting('quiet', args[1])
+
+                MDLabel:
+                    text: "Сообщения приблизительны и не обещают точное время начала дождя/снега. Оценка по прогнозу MET Norway."
+                    halign: "left"
+                    size_hint_y: None
+                    height: max(dp(28), self.texture_size[1] + dp(4))
+                    font_size: "11sp"
+                    text_size: self.width, None
+                    theme_text_color: "Custom"
+                    text_color: 0.55, 0.7, 0.55, 1
+
             # Почасовая погода — ровно 24 карточки: текущий час + следующие 23 часа
             MDLabel:
                 id: hourly_label
@@ -2456,6 +2823,11 @@ class WildVantage(MDApp):
         self.cache_file = CACHE_FILE
         self.fav_file = FAV_FILE
         self.favorites = load_favorites(self.fav_file)
+        self.notify_file = NOTIFY_SETTINGS_FILE
+        try:
+            self.notify_settings = load_settings(self.notify_file)
+        except Exception:
+            self.notify_settings = dict(DEFAULT_SETTINGS)
         self._cities_open = False          # экран «Управление городами» открыт
         self._fav_refresh_active = False   # идёт фоновое освежение снимков
         self._fav_refresh_queue = []
@@ -2481,6 +2853,7 @@ class WildVantage(MDApp):
         self._set_safe_areas()
         self._start_gen = self._gen
         Clock.schedule_once(self._safe_start, 2)
+        Clock.schedule_once(self._sync_notify_ui, 0)
         # Подхват кэша, пока приложение открыто: фоновый Java-воркер
         # (WorkManager, ~15 мин) пишет сырой ответ — мы принимаем его в кэш
         # и обновляем показ без закрытия приложения. Это НЕ механизм
@@ -2696,6 +3069,50 @@ class WildVantage(MDApp):
         except Exception:
             pass
 
+    def set_notify_setting(self, key, value):
+        """Переключатель уведомлений: сохранить, при включении мастера на
+        Android 13+ запросить POST_NOTIFICATIONS."""
+        key = str(key)
+        if key not in DEFAULT_SETTINGS:
+            return False
+        settings = dict(getattr(self, "notify_settings", DEFAULT_SETTINGS))
+        settings[key] = bool(value)
+        self.notify_settings = settings
+        try:
+            if _HAS_ALERTS:
+                save_settings(self.notify_file, settings)
+        except Exception as e:
+            self._log_exc("notify settings save", e)
+        if key == "enabled" and value and platform == "android":
+            try:
+                from android.permissions import (request_permissions, Permission)
+                request_permissions([Permission.POST_NOTIFICATIONS])
+            except Exception:
+                pass
+        self.log("notify settings:", key, "=", bool(value))
+        return True
+
+    def _sync_notify_ui(self, *_args):
+        """Отразить сохранённые настройки уведомлений в переключателях."""
+        try:
+            ids = self.root.ids
+            for wid, key in (
+                ("notify_master", "enabled"),
+                ("notify_rain", "rain"),
+                ("notify_snow", "snow"),
+                ("notify_thunder", "thunder"),
+                ("notify_wind", "wind"),
+                ("notify_temperature", "temperature"),
+                ("notify_pressure", "pressure"),
+                ("notify_quiet", "quiet"),
+            ):
+                w = getattr(ids, wid, None)
+                if w is not None:
+                    w.active = bool(
+                        (getattr(self, "notify_settings", {}) or {}).get(key, False))
+        except Exception:
+            pass
+
     def _set_coords_text(self, lat, lon, accuracy):
         text = f"{lat:.5f}, {lon:.5f}"
         try:
@@ -2871,6 +3288,7 @@ class WildVantage(MDApp):
         self._gps_best = None
         self._gps_last_ts = 0.0
         self._gps_active = False
+        self._gps_from_card = False
 
     def _cancel_gps_timers(self):
         for attr in ("_gps_deadline", "_gps_settle"):
@@ -3089,6 +3507,17 @@ class WildVantage(MDApp):
         if best is None:
             self.log("gps: завершение —", reason, "| валидных fix нет")
             self._set_gps_status("GPS: нет сигнала. Проверьте небо и разрешение.")
+            # Из карточки «текущее место»: без фиксы показываем данные по
+            # последним ПОДТВЕРЖДЁННЫМ координатам (если они есть) — погода
+            # всё равно обновится, только по проверенному месту.
+            if getattr(self, "_gps_from_card", False):
+                self._gps_from_card = False
+                prev = self._last_coords or {}
+                if prev.get("lat") is not None and prev.get("lon") is not None:
+                    self._set_status(
+                        "GPS недоступен: показаны данные по последним координатам")
+                    self.start_update(prev["lat"], prev["lon"],
+                                      source="gps", timeout=15)
             return
         self.log(
             "gps: завершение —", reason,
@@ -3097,6 +3526,7 @@ class WildVantage(MDApp):
         )
         # Итог GPS — в свой блок (не в статус погоды).
         self._set_gps_status(f"GPS: ±{best['accuracy']:.0f} м")
+        self._gps_from_card = False
         timeout = 3 if self.is_wilderness else 20
         self.start_update(
             best["lat"], best["lon"],
@@ -3561,12 +3991,18 @@ class WildVantage(MDApp):
         return True
 
     def _render_cities_list(self):
-        """Карточки сохранённых городов (название, состояние, temp, min/max)."""
+        """Карточки: GPS-место всегда первое, затем избранные города.
+        GPS-карточка неделимая (без корзины) и не дублируется в избранных:
+        она показывает ТЕКУЩЕЕ местоположение устройства, а не город."""
         try:
             lst = self.root.ids.cities_list
         except Exception:
             return
         lst.clear_widgets()
+        try:
+            lst.add_widget(self._build_gps_card())
+        except Exception as e:
+            self._log_exc("gps card", e)
         cities = getattr(self, "favorites", []) or []
         if not cities:
             lst.add_widget(MDLabel(
@@ -3581,6 +4017,117 @@ class WildVantage(MDApp):
                 lst.add_widget(self._build_city_card(item))
             except Exception as e:
                 self._log_exc("city card", e)
+
+    def _gps_card_state(self):
+        """Снимок данных для GPS-карточки (координаты, погода, название)."""
+        return {
+            "coords": self._last_coords or {},
+            "weather": self._last_weather,
+            "loc_name": getattr(self, "_loc_name", "") or "Текущее местоположение",
+        }
+
+    def _build_gps_card(self):
+        """Карточка текущего места: всегда первая, без удаления."""
+        v = gps_location_view(self._gps_card_state())
+        card = MDCard(
+            orientation="horizontal",
+            size_hint=(1, None),
+            padding=["12dp", "9dp", "6dp", "9dp"],
+            spacing="8dp",
+            radius=14,
+            elevation=0,
+            md_bg_color=(0.09, 0.16, 0.11, 1),
+            line_color=(0.25, 0.55, 0.3, 1),
+        )
+        card._fav_key = None
+        card._is_gps = True
+        card.add_widget(MDIcon(
+            icon="map-marker", font_size="24sp", size_hint=(None, None),
+            size=("28dp", "28dp"), theme_text_color="Custom",
+            text_color=(0.6, 1, 0.7, 1), valign="middle",
+        ))
+        mid = MDBoxLayout(orientation="vertical", size_hint_x=1,
+                          spacing="1dp", padding=("0dp", "0dp", "0dp", "2dp"))
+        for txt, fs, bold, col in (
+            (v["name"], "14sp", True, (0.95, 1, 0.95, 1)),
+        ):
+            lbl = MDLabel(
+                text=txt, bold=bold, font_size=fs, halign="left",
+                shorten=True, size_hint_y=None,
+                theme_text_color="Custom", text_color=col,
+            )
+            lbl.height = max(dp(17), lbl.texture_size[1] + dp(2))
+            lbl.bind(texture_size=lambda inst, ts, floor=dp(17):
+                     setattr(inst, "height", max(floor, ts[1] + dp(2))))
+            mid.add_widget(lbl)
+        row = MDBoxLayout(orientation="horizontal", size_hint_x=1,
+                          spacing="4dp")
+        row.add_widget(MDIcon(
+            icon=v["icon"], font_size="18sp", size_hint=(None, None),
+            size=("22dp", "22dp"), theme_text_color="Custom",
+            text_color=(0.75, 0.95, 0.8, 1), valign="middle",
+        ))
+        desc_lbl = MDLabel(
+            text=v["desc"], font_size="12sp", halign="left",
+            shorten=True, size_hint_y=None, valign="middle",
+            theme_text_color="Custom", text_color=(0.7, 0.9, 0.75, 1),
+        )
+        desc_lbl.height = max(dp(17), desc_lbl.texture_size[1] + dp(2))
+        desc_lbl.bind(texture_size=lambda inst, ts:
+                      setattr(inst, "height", max(dp(17), ts[1] + dp(2))))
+        row.add_widget(desc_lbl)
+        mid.add_widget(row)
+        card.add_widget(mid)
+        right = MDBoxLayout(orientation="vertical", size_hint_x=None,
+                            width="64dp", spacing="1dp")
+        for txt, fs, bold, col, floor in (
+            (v["temp"], "18sp", True, (0.95, 1, 0.95, 1), dp(24)),
+            (f"{v['tmin']} / {v['tmax']}", "11sp", False,
+             (0.65, 0.85, 0.7, 1), dp(15)),
+        ):
+            lbl = MDLabel(
+                text=txt, bold=bold, font_size=fs, halign="right",
+                size_hint_y=None, theme_text_color="Custom", text_color=col,
+            )
+            lbl.height = max(floor, lbl.texture_size[1] + dp(2))
+            lbl.bind(texture_size=lambda inst, ts, f=floor:
+                     setattr(inst, "height", max(f, ts[1] + dp(2))))
+            right.add_widget(lbl)
+        card.add_widget(right)
+        card._trash = None
+        # Тап по GPS-карточке — возврат на главный экран и обновление по месту
+        card.bind(on_touch_down=self._on_city_card_touch)
+        card.bind(on_touch_up=self._on_city_card_touch_up)
+        card.height = card.minimum_height
+        card.bind(minimum_height=lambda inst, mh: setattr(inst, "height", mh))
+        return card
+
+    def select_gps_current(self, *args):
+        """Тап по GPS-карточке: вернуться к погоде ТЕКУЩЕГО места.
+
+        Показывает кэш/последние данные (карточка уже отражает их), затем
+        запускает обновление: при доступном GPS — уточнение координат,
+        иначе — последние подтверждённые координаты (если GPS недоступен,
+        данные обновляются по ним же). Без координат — сообщение.
+        """
+        coords = self._last_coords or {}
+        lat, lon = coords.get("lat"), coords.get("lon")
+        if lat is None or lon is None:
+            self._set_status("Местоположение недоступно")
+            return False
+        try:
+            self.close_cities_screen()
+        except Exception:
+            pass
+        self._set_status("Обновляю погоду в текущем месте…")
+        # При рабочем GPS — уточнение координат (свежий MET после фиксы);
+        # иначе — обновление по последним подтверждённым координатам.
+        if gps is not None:
+            self._gps_from_card = True
+            self.run_gps_logic()
+        else:
+            self.start_update(lat, lon, source="gps", timeout=15)
+        return True
 
     def _build_city_card(self, item):
         v = favorite_city_view(item)
@@ -3667,11 +4214,14 @@ class WildVantage(MDApp):
             trash = getattr(card, "_trash", None)
             if trash is not None and trash.collide_point(*touch.pos):
                 return
-            # короткое нажатие без сдвига = выбор города (скролл не триггерит)
+            # короткое нажатие без сдвига = выбор (скролл не триггерит)
             if abs(touch.x - start[0]) <= dp(20) and abs(touch.y - start[1]) <= dp(20):
-                key = getattr(card, "_fav_key", None)
-                if key:
-                    self.select_favorite(key)
+                if getattr(card, "_is_gps", False):
+                    self.select_gps_current()
+                else:
+                    key = getattr(card, "_fav_key", None)
+                    if key:
+                        self.select_favorite(key)
         except Exception as e:
             self._log_exc("city card touch up", e)
 

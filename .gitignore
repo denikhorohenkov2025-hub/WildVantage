@@ -4,3 +4,8 @@ bin/
 build/
 dist/
 .env
+release/
+wildvantage_v*.json
+wildvantage_favorites.json
+wildvantage_notify.json
+wildvantage_bg_raw*.json
