@@ -78,7 +78,7 @@ GPS_MOVE_DIST = 0.1
 # фоновый Java-воркер (WeatherNotifier) для уведомлений при закрытом
 # приложении. Правила анализа — в services/alerts.py (зеркалятся Java).
 NOTIFY_SETTINGS_FILE = "wildvantage_notify.json"
-APP_VERSION = "13.1.3"
+APP_VERSION = "13.1.0"
 NOMINATIM_UA = "WildVantage (Android weather app; contact: denikhorohenkov2025-hub)"
 # MET Norway требует идентифицирующий User-Agent (иначе 403): имя приложения
 # + версия + контакт. Запрещены generic-строки вроде okhttp/Dalvik/Java.

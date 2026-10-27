@@ -11,10 +11,10 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,json
 
 # Можно поднять при релизе
-version = 13.1.3
+version = 13.1.0
 
-# versionCode для установки поверх тестовых/старых сборок (13.1.3).
-android.numeric_version = 130103
+# versionCode для установки поверх тестовых/старых сборок (13.1.0).
+android.numeric_version = 130100
 
 # tzdata — IANA-пояса на Android (zoneinfo без системного tzdata):
 # часы прогноза и «Обновлено» считаются по поясу места.
