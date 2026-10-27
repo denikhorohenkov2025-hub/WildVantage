@@ -58,7 +58,7 @@ public class WeatherUpdateWorker extends Worker {
             "https://api.met.no/weatherapi/locationforecast/2.0/complete"
                     + "?lat=%s&lon=%s";
     private static final String MET_UA =
-            "WILDVANTAGE/13.0.9 (github.com/denikhorohenkov2025-hub/WildVantage)";
+            "WILDVANTAGE/13.1.3 (github.com/denikhorohenkov2025-hub/WildVantage)";
 
     public WeatherUpdateWorker(Context context, WorkerParameters params) {
         super(context, params);
@@ -98,12 +98,21 @@ public class WeatherUpdateWorker extends Worker {
                     String.format(Locale.US, "%.4f", lat),
                     String.format(Locale.US, "%.4f", lon));
             byte[] body = httpGet(url);
+            // ТЗ6: в raw кладём обёртку с координатами запроса — Python
+            // (consume_bg_raw) сверяет их с текущим городом в кэше и
+            // отбрасывает ЧУЖОЙ ответ (гонка: город сменился, пока fetch
+            // был в полёте). Python принимает и старый формат (голое тело).
+            JSONObject wrapper = new JSONObject();
+            wrapper.put("lat", lat);
+            wrapper.put("lon", lon);
+            wrapper.put("response",
+                    new JSONObject(new String(body, StandardCharsets.UTF_8)));
             // Атомарная запись сырого ответа: tmp + fsync + rename.
             File tmp = new File(dir, RAW_TMP);
             File raw = new File(dir, RAW_FILE);
             FileOutputStream out = new FileOutputStream(tmp);
             try {
-                out.write(body);
+                out.write(wrapper.toString().getBytes(StandardCharsets.UTF_8));
                 out.flush();
                 try {
                     out.getFD().sync();

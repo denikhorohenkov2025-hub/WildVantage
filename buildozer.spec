@@ -11,7 +11,10 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,json
 
 # Можно поднять при релизе
-version = 13.0.9
+version = 13.1.3
+
+# versionCode для установки поверх тестовых/старых сборок (13.1.3).
+android.numeric_version = 130103
 
 # tzdata — IANA-пояса на Android (zoneinfo без системного tzdata):
 # часы прогноза и «Обновлено» считаются по поясу места.
@@ -21,7 +24,7 @@ orientation = portrait
 
 fullscreen = 0
 
-android.permissions = INTERNET, ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION, POST_NOTIFICATIONS
+android.permissions = INTERNET, ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION, POST_NOTIFICATIONS, RECEIVE_BOOT_COMPLETED
 
 android.api = 31
 

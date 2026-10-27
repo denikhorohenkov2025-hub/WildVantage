@@ -71,6 +71,9 @@ public final class WeatherNotifier {
     private static final String FROST = "frost";
     private static final String PRESSURE = "pressure";
 
+    // Ключи per-type переключателей в wildvantage_notify.json (те же, что
+    // пишет Python-экран настроек). Отдельные типы уведомлений, которые не
+    // имеют собственного переключателя, попадают в «temperature».
     private static final String CATEGORY_TEMP = "temperature";
     private static final String CATEGORY_PRESSURE = "pressure";
 
@@ -85,6 +88,10 @@ public final class WeatherNotifier {
             }
             if (!settingsEnabled(appDir)) {
                 Log.i(TAG, "notify: отключено в настройках");
+                return;
+            }
+            JSONObject settings = readSettings(appDir);
+            if (settings == null) {
                 return;
             }
             if (Build.VERSION.SDK_INT >= 33
@@ -103,9 +110,13 @@ public final class WeatherNotifier {
                     PREFS, Context.MODE_PRIVATE);
             long nowEpoch = System.currentTimeMillis() / 1000L;
             int hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
-            boolean quiet = isQuiet(appDir, hour);
+            boolean quiet = isQuiet(settings, hour);
             List<Alert> toPost = new ArrayList<>();
             for (Alert a : alerts) {
+                if (!typeEnabled(settings, a.type)) {
+                    Log.i(TAG, "notify: тип отключён в настройках: " + a.type);
+                    continue;
+                }
                 if (quiet && !a.critical) {
                     continue;
                 }
@@ -141,29 +152,68 @@ public final class WeatherNotifier {
         }
     }
 
-    private static boolean settingsEnabled(File appDir) {
+    /** Прочитать настройки уведомлений (null — файла нет или он битый). */
+    private static JSONObject readSettings(File appDir) {
         try {
             File f = new File(appDir, SETTINGS_FILE);
             if (!f.isFile()) {
-                return false; // по умолчанию уведомления выключены
+                return null;
             }
             byte[] bytes = readCapped(f);
-            JSONObject s = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
-            return s.optBoolean("enabled", false);
+            return new JSONObject(new String(bytes, StandardCharsets.UTF_8));
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static boolean settingsEnabled(File appDir) {
+        try {
+            JSONObject s = readSettings(appDir);
+            // по умолчанию уведомления выключены (файла нет/битый)
+            return s != null && s.optBoolean("enabled", false);
         } catch (Throwable t) {
             return false;
         }
     }
 
-    private static boolean isQuiet(File appDir, int hour) {
+    /** Ключ настройки для типа уведомления (per-type переключатели). */
+    static String settingKey(String type) {
+        if (RAIN.equals(type)) {
+            return "rain";
+        }
+        if (SNOW.equals(type)) {
+            return "snow";
+        }
+        if (THUNDER.equals(type)) {
+            return "thunder";
+        }
+        if (WIND.equals(type)) {
+            return "wind";
+        }
+        if (PRESSURE.equals(type)) {
+            return CATEGORY_PRESSURE;
+        }
+        // temp_drop / temp_rise / heat / frost — общий переключатель temp.
+        return CATEGORY_TEMP;
+    }
+
+    /**
+     * Разрешён ли тип уведомления в настройках.
+     *
+     * Значение по умолчанию — true: отсутствующий ключ не должен молча
+     * отключать уведомления (совместимость со старыми файлами настроек).
+     * Видимость package-private — для локальных тестов без Android.
+     */
+    static boolean typeEnabled(JSONObject s, String type) {
+        if (s == null) {
+            return true;
+        }
+        return s.optBoolean(settingKey(type), true);
+    }
+
+    private static boolean isQuiet(JSONObject s, int hour) {
         try {
-            File f = new File(appDir, SETTINGS_FILE);
-            if (!f.isFile()) {
-                return false;
-            }
-            byte[] bytes = readCapped(f);
-            JSONObject s = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
-            if (!s.optBoolean("quiet", false)) {
+            if (s == null || !s.optBoolean("quiet", false)) {
                 return false;
             }
             return hour >= 23 || hour < 7;
@@ -181,6 +231,7 @@ public final class WeatherNotifier {
                 NotificationManager.IMPORTANCE_HIGH);
         ch.setDescription("Оповещения о дожде, снеге, грозе, ветре, "
                 + "скачках температуры и давления");
+        ch.setShowBadge(true);
         nm.createNotificationChannel(ch);
     }
 
@@ -209,6 +260,12 @@ public final class WeatherNotifier {
                 .setAutoCancel(true)
                 .setCategory(Notification.CATEGORY_ALARM)
                 .setWhen(System.currentTimeMillis());
+        if (Build.VERSION.SDK_INT < 26) {
+            // Android 8.0+: важность задаёт канал (IMPORTANCE_HIGH = heads-up).
+            // На старых версиях heads-up требует PRIORITY_HIGH.
+            //noinspection deprecation
+            b.setPriority(Notification.PRIORITY_HIGH);
+        }
         return b.build();
     }
 

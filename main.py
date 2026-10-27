@@ -67,11 +67,18 @@ FAV_DUP_DIST = 0.02
 # Сырой ответ MET Norway, который атомарно пишет фоновый Java-воркер
 # (WorkManager) рядом с кэшем; Python принимает его в consume_bg_raw.
 BG_RAW_FILE = "wildvantage_bg_raw_v2.json"
+# Независимый постоянный кэш GPS-места: координаты, название, погода
+# (current/hours/daily), время успеха. Живёт отдельно от кэша городов,
+# поэтому выбор города и фоновая запись его не затирают.
+GPS_FILE = "wildvantage_gps.json"
+# Смещение координат, при котором GPS-точка считается ДРУГОЙ: старый
+# снимок нельзя показывать как погоду нового места (~11 км).
+GPS_MOVE_DIST = 0.1
 # Настройки погодных уведомлений: локальный JSON; пишет Python UI, читает
 # фоновый Java-воркер (WeatherNotifier) для уведомлений при закрытом
 # приложении. Правила анализа — в services/alerts.py (зеркалятся Java).
 NOTIFY_SETTINGS_FILE = "wildvantage_notify.json"
-APP_VERSION = "13.0.9"
+APP_VERSION = "13.1.3"
 NOMINATIM_UA = "WildVantage (Android weather app; contact: denikhorohenkov2025-hub)"
 # MET Norway требует идентифицирующий User-Agent (иначе 403): имя приложения
 # + версия + контакт. Запрещены generic-строки вроде okhttp/Dalvik/Java.
@@ -924,6 +931,141 @@ def meteo_dialog_text(meteo):
     return "\n".join(lines)
 
 
+# --- Геомагнитная активность: реальные данные NOAA SWPC -------------------
+# Планетарный Kp-индекс (глобальный, 3-часовые интервалы). Публичные данные
+# NOAA SWPC (продукт noaa-planetary-k-index; домен США, public domain), без
+# ключа и регистрации. ВАЖНО: это ГЛОБАЛЬНЫЙ индекс геомагнитного поля, а НЕ
+# локальный биометеорологический прогноз и не оценка самочувствия.
+GEOMAG_URL = ("https://services.swpc.noaa.gov/products/"
+              "noaa-planetary-k-index.json")
+GEOMAG_SOURCE = "NOAA SWPC"
+
+
+def _kp_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def geomag_level(kp):
+    """Уровень по планетарному Kp (шкала NOAA G1..G5, порог бури Kp≥5)."""
+    kp = _kp_float(kp)
+    if kp is None:
+        return {"key": "nd", "label": "н/д", "explanation": "Данных нет."}
+    if kp < 4.0:
+        return {"key": "quiet", "label": "Спокойная",
+                "explanation": "Геомагнитное поле спокойное, бури нет."}
+    if kp < 5.0:
+        return {"key": "active", "label": "Возмущённая",
+                "explanation": "Слабо возмущённое поле; обычно без заметных "
+                               "эффектов на технику."}
+    if kp < 6.0:
+        return {"key": "g1", "label": "Слабая буря (G1)",
+                "explanation": "Слабая геомагнитная буря (уровень G1)."}
+    if kp < 7.0:
+        return {"key": "g2", "label": "Умеренная буря (G2)",
+                "explanation": "Умеренная геомагнитная буря (уровень G2)."}
+    if kp < 8.0:
+        return {"key": "g3", "label": "Сильная буря (G3)",
+                "explanation": "Сильная геомагнитная буря (уровень G3)."}
+    if kp < 9.0:
+        return {"key": "g4", "label": "Очень сильная буря (G4)",
+                "explanation": "Очень сильная геомагнитная буря (уровень G4)."}
+    return {"key": "g5", "label": "Экстремальная буря (G5)",
+            "explanation": "Экстремальная геомагнитная буря (уровень G5)."}
+
+
+def parse_kp_index(raw):
+    """Ответ NOAA SWPC (список {time_tag, Kp, ...}) -> актуальная точка Kp.
+
+    Берём точку с САМЫМ ПОЗДНИМ time_tag (порядок строк в ответе не
+    гарантирован), а при отсутствии времени — последнюю с Kp. Любая
+    ошибка/пусто -> None (значение не выдумываем). raw может быть list,
+    bytes или str.
+    """
+    try:
+        arr = raw
+        if isinstance(raw, (bytes, str)):
+            arr = json.loads(raw)
+        if not isinstance(arr, list) or not arr:
+            return None
+        last = None
+        for e in arr:
+            if isinstance(e, dict) and e.get("Kp") is not None:
+                last = e
+        if last is None:
+            return None
+        # Актуальность — по времени данных, а не по позиции в массиве.
+        try:
+            timed = [e for e in arr
+                     if isinstance(e, dict) and e.get("Kp") is not None
+                     and str(e.get("time_tag") or "")]
+            if timed:
+                last = max(timed, key=lambda e: str(e.get("time_tag") or ""))
+        except Exception:
+            pass
+        kp = _kp_float(last.get("Kp"))
+        if kp is None:
+            return None
+        lvl = geomag_level(kp)
+        return {
+            "kp": kp,
+            "time_tag": str(last.get("time_tag") or ""),
+            "source": GEOMAG_SOURCE,
+            "level": lvl["key"],
+            "label": lvl["label"],
+            "explanation": lvl["explanation"],
+        }
+    except Exception:
+        return None
+
+
+def geomag_line(geomag):
+    """Короткая строка «Геомагнитная активность» для главного экрана."""
+    if not isinstance(geomag, dict) or geomag.get("kp") is None:
+        return "Геомагнитная активность: н/д"
+    return "Геомагнитная активность: Kp {:.0f} — {}".format(
+        float(geomag["kp"]), geomag.get("label") or "н/д")
+
+
+def geomag_dialog_text(geomag):
+    """Пояснение по геомагнитной активности (реальные данные NOAA)."""
+    if not isinstance(geomag, dict) or geomag.get("kp") is None:
+        return ("Геомагнитная активность: данных нет.\n"
+                "Источник: " + GEOMAG_SOURCE + ".")
+    kp = float(geomag["kp"])
+    lines = [
+        "Геомагнитная активность — планетарный Kp-индекс",
+        "",
+        "Kp: {:.0f} — {}.".format(kp, geomag.get("label") or "н/д"),
+        geomag.get("explanation") or "",
+        "",
+        "Источник: {} (планетарный Kp-индекс, 3-часовые интервалы).".format(
+            geomag.get("source") or GEOMAG_SOURCE),
+    ]
+    tt = (geomag.get("time_tag") or "").replace("T", " ")[:16]
+    if tt:
+        lines.append("Данные на: {} UTC.".format(tt))
+    lines.append("")
+    lines.append("Внимание: это ГЛОБАЛЬНЫЙ индекс геомагнитного поля, а не "
+                 "локальный биометеорологический прогноз и не оценка "
+                 "индивидуального самочувствия.")
+    return "\n".join(lines)
+
+
+def activity_dialog_text(geomag, meteo):
+    """Единый диалог: ДВА отдельных раздела (геомагнетизм + погодные факторы).
+
+    Разделы намеренно НЕ смешаны в один «медицинский индекс»: геомагнитная
+    активность — реальные данные NOAA, погодные факторы — данные MET Norway.
+    """
+    return ("=== ГЕОМАГНИТНАЯ АКТИВНОСТЬ ===\n"
+            + geomag_dialog_text(geomag)
+            + "\n\n=== ПОГОДНЫЕ ФАКТОРЫ (MET Norway) ===\n"
+            + meteo_dialog_text(meteo))
+
+
 def _sun_events(lat, lon, date_str, tzinfo=None):
     """Восход/закат по NOAA-алгоритму (детерминированный расчёт, не данные
     модели). Возвращает dict: sunrise/sunset — datetime в tzinfo (или None),
@@ -1486,6 +1628,28 @@ def success_moment(weather):
     return {"unix": int(time.time()), "offset": offset}
 
 
+def favorite_success_moment(item, weather=None):
+    """Момент последнего успешного обновления КОНКРЕТНОГО города.
+
+    Хранится в карточке избранного (weather_at); offset берём из пояса
+    ответа, чтобы «Обновлено: HH:MM» было в местном времени города.
+    None — город ещё ни разу не обновлялся (не подставляем чужое время).
+    """
+    if not isinstance(item, dict):
+        return None
+    try:
+        unix = int(item.get("weather_at"))
+    except (TypeError, ValueError):
+        return None
+    offset = 0
+    if isinstance(weather, dict):
+        try:
+            offset = int(weather.get("utc_offset_seconds") or 0)
+        except (TypeError, ValueError):
+            offset = 0
+    return {"unix": unix, "offset": offset}
+
+
 def record_success_unix(record):
     """unix последнего успеха из кэш-записи (None, если запись старого формата)."""
     if not isinstance(record, dict):
@@ -1565,6 +1729,22 @@ def apply_weather_record(path, weather):
     old_ls = record.get("last_success")
     if not isinstance(old_ls, dict):
         old_ls = None
+    # ТЗ4: фоновое обновление не должно стирать прошедшие часы текущего дня.
+    # Новый прогноз начинается с текущего часа — историю берём из прежней
+    # записи (того же места; mergeHours сам отсекает другие дни).
+    try:
+        old_weather = record.get("weather")
+        old_hours = (old_weather.get("hours")
+                     if isinstance(old_weather, dict) else None)
+        if old_hours:
+            merged = merge_hours_history(
+                old_hours, weather.get("hours") or [],
+                (weather.get("current") or {}).get("time"))
+            if merged:
+                weather = dict(weather)
+                weather["hours"] = merged
+    except Exception:
+        pass
     coords_full = record.get("coords")
     new_record = {
         "coords": coords_full if isinstance(coords_full, dict) else {},
@@ -1575,6 +1755,9 @@ def apply_weather_record(path, weather):
         "weather": weather,
         "last_success": pick_newer_success(old_ls, moment),
         "saved_at": datetime.now().strftime("%d.%m %H:%M"),
+        # Источник переживает фоновое обновление (иначе после перезапуска
+        # GPS-снимок нельзя отличить от выбранного города).
+        "source": record.get("source") or "gps",
     }
     # Атомарная запись: temp-файл + os.replace (читатель не видит полфайла).
     tmp = path + ".tmp"
@@ -1594,6 +1777,21 @@ def apply_weather_record(path, weather):
         except Exception:
             pass
         return False
+    # Независимый GPS-кэш: если обновлялось GPS-место, зеркалим свежий
+    # снимок в отдельный файл. Выбор города/его кэш на него не влияют.
+    try:
+        if (new_record.get("source") or "gps") == "gps":
+            mirror = gps_cache_record(
+                new_record.get("coords"), weather,
+                new_record.get("location_name") or "",
+                new_record.get("location_tz"),
+                new_record.get("last_success"),
+            )
+            if mirror is not None:
+                base = os.path.dirname(os.path.abspath(path))
+                save_gps_cache(os.path.join(base, GPS_FILE), mirror)
+    except Exception:
+        pass
     return True
 
 
@@ -1686,6 +1884,27 @@ def consume_bg_raw(path=None):
                     lat, lon = coords
         except Exception:
             pass
+        # ТЗ6: воркер кладёт обёртку {lat, lon, response}. Если её координаты
+        # далеко от текущего города в кэше — это ЧУЖОЙ (не успевший записаться)
+        # ответ: отбрасываем, иначе погода одного города ляжет под именем
+        # другого. Старый формат (голое тело ответа) принимаем без проверки.
+        raw_lat = raw_lon = None
+        if isinstance(data, dict) and "response" in data and (
+                "lat" in data or "lon" in data):
+            resp = data.get("response")
+            if not isinstance(resp, dict):
+                print(f"[BG] consume end ok=False reason=bad-wrapper epoch={int(time.time())}",
+                      flush=True)
+                return False
+            raw_lat = data.get("lat")
+            raw_lon = data.get("lon")
+            data = resp
+        if (raw_lat is not None and raw_lon is not None
+                and lat is not None and lon is not None
+                and not coords_near(raw_lat, raw_lon, lat, lon, dist=0.05)):
+            print(f"[BG] consume end ok=False reason=foreign-city epoch={int(time.time())}",
+                  flush=True)
+            return False
         weather = normalize_metno(data, tz=tz, lat=lat, lon=lon)
         ok = apply_weather_record(path, weather)
         print(f"[BG] consume end ok={ok} epoch={int(time.time())} dur_ms="
@@ -1771,6 +1990,96 @@ def slice_hours(hours, current_iso, count=24):
         else:
             start = 0
     return hours[start:start + count]
+
+
+def merge_hours_history(prev_hours, new_hours, current_iso):
+    """Сохранить ПРОШЕДШИЕ часы текущих суток при обновлении прогноза.
+
+    MET отдаёт прогноз, начинающийся с текущего часа: без слияния лента
+    после каждого обновления теряла бы утро/день (ТЗ4). Правило:
+      * прошедшие часы (time < текущий час) текущего локального дня берём
+        из прежнего снимка ЭТОГО ЖЕ города;
+      * текущий и будущие часы — всегда из свежего прогноза;
+      * часы других дней не переносим (после полуночи история нового дня
+        начинается честно с имеющихся данных, без выдуманных утренних).
+    Ничего не выдумываем: если прежней записи нет — остаётся только новый
+    прогноз. Возвращает список, отсортированный по времени.
+    """
+    if not isinstance(new_hours, list) or not new_hours:
+        return list(prev_hours or [])
+    cur_key = str(current_iso or "")
+    day = cur_key[:10] if len(cur_key) >= 10 else None
+    hour_key = cur_key[:13] if len(cur_key) >= 13 else None
+    by_time = {}
+    if day and hour_key:
+        for h in prev_hours or []:
+            if not isinstance(h, dict):
+                continue
+            t = h.get("time")
+            if isinstance(t, str) and len(t) >= 13 and t[:10] == day \
+                    and t[:13] < hour_key:
+                by_time[t] = h
+    for h in new_hours:
+        if not isinstance(h, dict):
+            continue
+        t = h.get("time")
+        if not isinstance(t, str):
+            continue
+        # Прошедший час, который уже был сохранён, не перезаписываем новым
+        # прогнозом (история не должна «сдвигаться»).
+        if hour_key and t[:13] < hour_key and t in by_time:
+            continue
+        by_time[t] = h
+    return sorted(by_time.values(), key=lambda x: str(x.get("time") or ""))
+
+
+def city_today_iso(weather=None, now=None):
+    """Дата «сегодня» в часовом поясе места (для честной подписи ленты).
+
+    Нужна, чтобы старый кэш (например, открыли приложение на следующий день
+    без сети) не выдавал вчерашние часы за «сегодня». Пояс берём из ответа
+    MET (IANA), иначе — числовой сдвиг; при отсутствии обоих считаем UTC.
+    """
+    now = now or datetime.now(timezone.utc)
+    w = weather if isinstance(weather, dict) else {}
+    tzname = w.get("timezone")
+    if ZoneInfo and isinstance(tzname, str) and tzname and tzname != "device":
+        try:
+            return now.astimezone(ZoneInfo(tzname)).date().isoformat()
+        except Exception:
+            pass
+    try:
+        off = int(w.get("utc_offset_seconds") or 0)
+    except (TypeError, ValueError):
+        off = 0
+    return (now + timedelta(seconds=off)).date().isoformat()
+
+
+def hours_for_local_day(hours, current_iso):
+    """Все часы локального календарного дня (00:00–23:00) даты current_iso.
+
+    Возвращает часы текущих суток города — включая уже прошедшие часы
+    (они показываются приглушёнными; это сохранённый прогноз модели, а НЕ
+    фактические наблюдения — признак «прошло» передаётся в UI). День с
+    переходом на летнее/зимнее время содержит 23 или 25 записей — отдаём
+    ровно то, что есть в данных, ничего не выдумывая. Нет данных за день —
+    пустой список. Нет current_iso — первые count часов (совместимость).
+    """
+    if not hours:
+        return []
+    day = None
+    if isinstance(current_iso, str) and len(current_iso) >= 10:
+        day = current_iso[:10]  # YYYY-MM-DD
+    if day is None:
+        return list(hours)[:24]
+    out = []
+    for h in hours:
+        t = h.get("time")
+        if not isinstance(t, str) or len(t) < 10:
+            continue
+        if t[:10] == day:
+            out.append(h)
+    return out
 
 
 # --- ИЗБРАННЫЕ ГОРОДА (хранение и модель) ---
@@ -1859,6 +2168,92 @@ def save_favorites(path, cities):
         except Exception:
             pass
         return False
+
+
+def gps_cache_record(coords, weather, name="", tz=None, last_success=None):
+    """Запись независимого GPS-кэша (единый формат диск/память)."""
+    if not isinstance(coords, dict) or not isinstance(weather, dict):
+        return None
+    if coords.get("lat") is None or coords.get("lon") is None:
+        return None
+    if not weather.get("daily"):
+        return None
+    return {
+        "coords": dict(coords),
+        "location_name": str(name or ""),
+        "location_tz": tz,
+        "weather": weather,
+        "last_success": last_success if isinstance(last_success, dict) else None,
+        "saved_at": datetime.now().strftime("%d.%m %H:%M"),
+    }
+
+
+def load_gps_cache(path):
+    """Прочитать GPS-кэш. Нет файла/повреждение/неполные данные -> None.
+
+    Ничего не подставляем: без координат и погоды запись не принимается,
+    поэтому чужие/битые данные не могут выглядеть как погода GPS-места.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rec = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(rec, dict):
+        return None
+    coords = rec.get("coords")
+    weather = rec.get("weather")
+    if not isinstance(coords, dict) or not isinstance(weather, dict):
+        return None
+    if coords.get("lat") is None or coords.get("lon") is None:
+        return None
+    if not weather.get("daily"):
+        return None
+    return {
+        "coords": coords,
+        "location_name": rec.get("location_name") or "",
+        "location_tz": rec.get("location_tz"),
+        "weather": weather,
+        "last_success": rec.get("last_success"),
+        "saved_at": rec.get("saved_at"),
+    }
+
+
+def save_gps_cache(path, record):
+    """Атомарная запись GPS-кэша (temp + fsync + os.replace)."""
+    if not isinstance(record, dict):
+        return False
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def clear_gps_cache(path):
+    """Удалить GPS-кэш (место сменилось существенно — старые данные чужие)."""
+    removed = False
+    for p in (path, path + ".tmp"):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+                removed = True
+        except Exception:
+            pass
+    return removed
 
 
 def favorite_city_view(item):
@@ -1993,6 +2388,227 @@ MDScreen:
                 height: self.minimum_height
                 spacing: "8dp"
 
+    # Экран «Настройки» (погодные уведомления). Свёрнут (height 0),
+    # объявлен ДО main_scroll: children[0] корня остаётся main_scroll.
+    MDBoxLayout:
+        id: settings_view
+        orientation: 'vertical'
+        size_hint_y: 0
+        height: 0
+        opacity: 0
+        disabled: True
+        padding: ["12dp", "12dp", "12dp", "12dp"]
+        spacing: "8dp"
+
+        MDBoxLayout:
+            orientation: 'horizontal'
+            size_hint_y: None
+            height: "48dp"
+            spacing: "4dp"
+            MDIconButton:
+                icon: "arrow-left"
+                size_hint_y: None
+                size_hint_x: None
+                size: "48dp", "48dp"
+                on_release: app.close_settings_screen()
+            MDLabel:
+                text: "Настройки"
+                bold: True
+                font_size: "17sp"
+                shorten: True
+                halign: "left"
+                valign: "middle"
+                size_hint_x: 1
+                text_size: self.width, None
+                theme_text_color: "Custom"
+                text_color: 0.85, 1, 0.85, 1
+
+        MDScrollView:
+            id: settings_scroll
+            do_scroll_x: False
+            bar_width: "3dp"
+            MDBoxLayout:
+                id: settings_list
+                orientation: 'vertical'
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: "8dp"
+
+                # Погодные уведомления (настройки)
+                MDCard:
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: self.minimum_height
+                    padding: ["16dp", "12dp", "16dp", "12dp"]
+                    spacing: "4dp"
+                    radius: 18
+                    elevation: 0
+                    md_bg_color: 0.1, 0.14, 0.1, 1
+                    line_color: 0.25, 0.45, 0.25, 1
+
+                    MDLabel:
+                        text: "ПОГОДНЫЕ УВЕДОМЛЕНИЯ"
+                        bold: True
+                        font_size: "14sp"
+                        size_hint_y: None
+                        height: max(dp(20), self.texture_size[1] + dp(4))
+                        theme_text_color: "Custom"
+                        text_color: 0.7, 0.95, 0.7, 1
+
+                    MDBoxLayout:
+                        orientation: 'horizontal'
+                        size_hint_y: None
+                        height: "40dp"
+                        spacing: "6dp"
+                        MDLabel:
+                            text: "Включить уведомления"
+                            halign: "left"
+                            valign: "middle"
+                            size_hint_x: 1
+                            font_size: "13sp"
+                            theme_text_color: "Custom"
+                            text_color: 0.85, 1, 0.85, 1
+                        MDSwitch:
+                            id: notify_master
+                            active: False
+                            on_active: app.set_notify_setting('enabled', args[1])
+
+                    MDBoxLayout:
+                        orientation: 'horizontal'
+                        size_hint_y: None
+                        height: "36dp"
+                        spacing: "6dp"
+                        MDLabel:
+                            text: "Дождь"
+                            halign: "left"
+                            valign: "middle"
+                            size_hint_x: 1
+                            font_size: "13sp"
+                            theme_text_color: "Custom"
+                            text_color: 0.8, 0.92, 0.8, 1
+                        MDSwitch:
+                            id: notify_rain
+                            active: True
+                            on_active: app.set_notify_setting('rain', args[1])
+
+                    MDBoxLayout:
+                        orientation: 'horizontal'
+                        size_hint_y: None
+                        height: "36dp"
+                        spacing: "6dp"
+                        MDLabel:
+                            text: "Снегопад"
+                            halign: "left"
+                            valign: "middle"
+                            size_hint_x: 1
+                            font_size: "13sp"
+                            theme_text_color: "Custom"
+                            text_color: 0.8, 0.92, 0.8, 1
+                        MDSwitch:
+                            id: notify_snow
+                            active: True
+                            on_active: app.set_notify_setting('snow', args[1])
+
+                    MDBoxLayout:
+                        orientation: 'horizontal'
+                        size_hint_y: None
+                        height: "36dp"
+                        spacing: "6dp"
+                        MDLabel:
+                            text: "Гроза"
+                            halign: "left"
+                            valign: "middle"
+                            size_hint_x: 1
+                            font_size: "13sp"
+                            theme_text_color: "Custom"
+                            text_color: 0.8, 0.92, 0.8, 1
+                        MDSwitch:
+                            id: notify_thunder
+                            active: True
+                            on_active: app.set_notify_setting('thunder', args[1])
+
+                    MDBoxLayout:
+                        orientation: 'horizontal'
+                        size_hint_y: None
+                        height: "36dp"
+                        spacing: "6dp"
+                        MDLabel:
+                            text: "Ветер"
+                            halign: "left"
+                            valign: "middle"
+                            size_hint_x: 1
+                            font_size: "13sp"
+                            theme_text_color: "Custom"
+                            text_color: 0.8, 0.92, 0.8, 1
+                        MDSwitch:
+                            id: notify_wind
+                            active: True
+                            on_active: app.set_notify_setting('wind', args[1])
+
+                    MDBoxLayout:
+                        orientation: 'horizontal'
+                        size_hint_y: None
+                        height: "36dp"
+                        spacing: "6dp"
+                        MDLabel:
+                            text: "Температура (жара/мороз/скачки)"
+                            halign: "left"
+                            valign: "middle"
+                            size_hint_x: 1
+                            font_size: "13sp"
+                            theme_text_color: "Custom"
+                            text_color: 0.8, 0.92, 0.8, 1
+                        MDSwitch:
+                            id: notify_temperature
+                            active: True
+                            on_active: app.set_notify_setting('temperature', args[1])
+
+                    MDBoxLayout:
+                        orientation: 'horizontal'
+                        size_hint_y: None
+                        height: "36dp"
+                        spacing: "6dp"
+                        MDLabel:
+                            text: "Перепад давления"
+                            halign: "left"
+                            valign: "middle"
+                            size_hint_x: 1
+                            font_size: "13sp"
+                            theme_text_color: "Custom"
+                            text_color: 0.8, 0.92, 0.8, 1
+                        MDSwitch:
+                            id: notify_pressure
+                            active: True
+                            on_active: app.set_notify_setting('pressure', args[1])
+
+                    MDBoxLayout:
+                        orientation: 'horizontal'
+                        size_hint_y: None
+                        height: "36dp"
+                        spacing: "6dp"
+                        MDLabel:
+                            text: "Тихий режим (ночь — только критичное)"
+                            halign: "left"
+                            valign: "middle"
+                            size_hint_x: 1
+                            font_size: "13sp"
+                            theme_text_color: "Custom"
+                            text_color: 0.8, 0.92, 0.8, 1
+                        MDSwitch:
+                            id: notify_quiet
+                            active: False
+                            on_active: app.set_notify_setting('quiet', args[1])
+
+                    MDLabel:
+                        text: "Сообщения приблизительны и не обещают точное время начала дождя/снега. Оценка по прогнозу MET Norway."
+                        halign: "left"
+                        size_hint_y: None
+                        height: max(dp(28), self.texture_size[1] + dp(4))
+                        font_size: "11sp"
+                        text_size: self.width, None
+                        theme_text_color: "Custom"
+                        text_color: 0.55, 0.7, 0.55, 1
+
     MDScrollView:
         id: main_scroll
         do_scroll_x: False
@@ -2011,15 +2627,27 @@ MDScreen:
                 size_hint_y: None
                 height: "0dp"
 
-            MDLabel:
-                text: "WILDVANTAGE"
-                halign: "center"
-                bold: True
+            # Заголовок + шестерёнка «Настройки» (правый верхний угол)
+            MDBoxLayout:
+                orientation: 'horizontal'
                 size_hint_y: None
-                height: max(dp(40), self.texture_size[1] + dp(6))
-                font_size: "22sp"
-                theme_text_color: "Custom"
-                text_color: 0.6, 0.9, 0.6, 1
+                height: max(dp(40), self.minimum_height)
+                spacing: "4dp"
+                MDLabel:
+                    text: "WILDVANTAGE"
+                    halign: "left"
+                    valign: "middle"
+                    bold: True
+                    size_hint_x: 1
+                    font_size: "22sp"
+                    theme_text_color: "Custom"
+                    text_color: 0.6, 0.9, 0.6, 1
+                MDIconButton:
+                    icon: "cog"
+                    size_hint_y: None
+                    size_hint_x: None
+                    size: "48dp", "48dp"
+                    on_release: app.open_settings_screen()
 
             # Поиск города
             MDBoxLayout:
@@ -2414,7 +3042,46 @@ MDScreen:
                             text_color: 0.75, 0.85, 0.75, 1
                         MDLabel:
                             id: meteoindex_label
-                            text: "Метеоиндекс: н/д"
+                            text: "Погодные факторы: н/д"
+                            font_size: "13sp"
+                            halign: "left"
+                            shorten: True
+                            size_hint_x: 1
+                            text_size: self.width, None
+                            theme_text_color: "Custom"
+                            text_color: 0.75, 0.85, 0.75, 1
+                    MDBoxLayout:
+                        size_hint_x: 1
+
+                # Геомагнитная активность: ОТДЕЛЬНЫЙ раздел (реальные данные
+                # NOAA SWPC, планетарный Kp). Не смешивается с погодными
+                # факторами; тап открывает общий диалог с двумя разделами.
+                MDBoxLayout:
+                    orientation: 'horizontal'
+                    size_hint_y: None
+                    height: max(dp(26), self.minimum_height)
+                    padding: dp(8), 0
+                    MDBoxLayout:
+                        size_hint_x: 1
+                    MDBoxLayout:
+                        id: geomag_row
+                        orientation: 'horizontal'
+                        size_hint: None, None
+                        width: "230dp"
+                        height: max(dp(24), self.minimum_height)
+                        spacing: "5dp"
+                        on_touch_down: app.geomag_touch(*args)
+                        MDIcon:
+                            id: geomag_icon
+                            icon: "earth"
+                            font_size: "15sp"
+                            size_hint: None, None
+                            size: "16dp", "16dp"
+                            theme_text_color: "Custom"
+                            text_color: 0.75, 0.85, 0.75, 1
+                        MDLabel:
+                            id: geomag_label
+                            text: "Геомагнитная активность: н/д"
                             font_size: "13sp"
                             halign: "left"
                             shorten: True
@@ -2592,190 +3259,23 @@ MDScreen:
                     MDBoxLayout:
                         size_hint_x: 1
 
-            # Погодные уведомления (настройки)
-            MDCard:
-                orientation: 'vertical'
-                size_hint_y: None
-                height: self.minimum_height
-                padding: ["16dp", "12dp", "16dp", "12dp"]
-                spacing: "4dp"
-                radius: 18
-                elevation: 0
-                md_bg_color: 0.1, 0.14, 0.1, 1
-                line_color: 0.25, 0.45, 0.25, 1
-
-                MDLabel:
-                    text: "ПОГОДНЫЕ УВЕДОМЛЕНИЯ"
-                    bold: True
-                    font_size: "14sp"
-                    size_hint_y: None
-                    height: max(dp(20), self.texture_size[1] + dp(4))
-                    theme_text_color: "Custom"
-                    text_color: 0.7, 0.95, 0.7, 1
-
-                MDBoxLayout:
-                    orientation: 'horizontal'
-                    size_hint_y: None
-                    height: "40dp"
-                    spacing: "6dp"
-                    MDLabel:
-                        text: "Включить уведомления"
-                        halign: "left"
-                        valign: "middle"
-                        size_hint_x: 1
-                        font_size: "13sp"
-                        theme_text_color: "Custom"
-                        text_color: 0.85, 1, 0.85, 1
-                    MDSwitch:
-                        id: notify_master
-                        active: False
-                        on_active: app.set_notify_setting('enabled', args[1])
-
-                MDBoxLayout:
-                    orientation: 'horizontal'
-                    size_hint_y: None
-                    height: "36dp"
-                    spacing: "6dp"
-                    MDLabel:
-                        text: "Дождь"
-                        halign: "left"
-                        valign: "middle"
-                        size_hint_x: 1
-                        font_size: "13sp"
-                        theme_text_color: "Custom"
-                        text_color: 0.8, 0.92, 0.8, 1
-                    MDSwitch:
-                        id: notify_rain
-                        active: True
-                        on_active: app.set_notify_setting('rain', args[1])
-
-                MDBoxLayout:
-                    orientation: 'horizontal'
-                    size_hint_y: None
-                    height: "36dp"
-                    spacing: "6dp"
-                    MDLabel:
-                        text: "Снегопад"
-                        halign: "left"
-                        valign: "middle"
-                        size_hint_x: 1
-                        font_size: "13sp"
-                        theme_text_color: "Custom"
-                        text_color: 0.8, 0.92, 0.8, 1
-                    MDSwitch:
-                        id: notify_snow
-                        active: True
-                        on_active: app.set_notify_setting('snow', args[1])
-
-                MDBoxLayout:
-                    orientation: 'horizontal'
-                    size_hint_y: None
-                    height: "36dp"
-                    spacing: "6dp"
-                    MDLabel:
-                        text: "Гроза"
-                        halign: "left"
-                        valign: "middle"
-                        size_hint_x: 1
-                        font_size: "13sp"
-                        theme_text_color: "Custom"
-                        text_color: 0.8, 0.92, 0.8, 1
-                    MDSwitch:
-                        id: notify_thunder
-                        active: True
-                        on_active: app.set_notify_setting('thunder', args[1])
-
-                MDBoxLayout:
-                    orientation: 'horizontal'
-                    size_hint_y: None
-                    height: "36dp"
-                    spacing: "6dp"
-                    MDLabel:
-                        text: "Ветер"
-                        halign: "left"
-                        valign: "middle"
-                        size_hint_x: 1
-                        font_size: "13sp"
-                        theme_text_color: "Custom"
-                        text_color: 0.8, 0.92, 0.8, 1
-                    MDSwitch:
-                        id: notify_wind
-                        active: True
-                        on_active: app.set_notify_setting('wind', args[1])
-
-                MDBoxLayout:
-                    orientation: 'horizontal'
-                    size_hint_y: None
-                    height: "36dp"
-                    spacing: "6dp"
-                    MDLabel:
-                        text: "Температура (жара/мороз/скачки)"
-                        halign: "left"
-                        valign: "middle"
-                        size_hint_x: 1
-                        font_size: "13sp"
-                        theme_text_color: "Custom"
-                        text_color: 0.8, 0.92, 0.8, 1
-                    MDSwitch:
-                        id: notify_temperature
-                        active: True
-                        on_active: app.set_notify_setting('temperature', args[1])
-
-                MDBoxLayout:
-                    orientation: 'horizontal'
-                    size_hint_y: None
-                    height: "36dp"
-                    spacing: "6dp"
-                    MDLabel:
-                        text: "Перепад давления"
-                        halign: "left"
-                        valign: "middle"
-                        size_hint_x: 1
-                        font_size: "13sp"
-                        theme_text_color: "Custom"
-                        text_color: 0.8, 0.92, 0.8, 1
-                    MDSwitch:
-                        id: notify_pressure
-                        active: True
-                        on_active: app.set_notify_setting('pressure', args[1])
-
-                MDBoxLayout:
-                    orientation: 'horizontal'
-                    size_hint_y: None
-                    height: "36dp"
-                    spacing: "6dp"
-                    MDLabel:
-                        text: "Тихий режим (ночь — только критичное)"
-                        halign: "left"
-                        valign: "middle"
-                        size_hint_x: 1
-                        font_size: "13sp"
-                        theme_text_color: "Custom"
-                        text_color: 0.8, 0.92, 0.8, 1
-                    MDSwitch:
-                        id: notify_quiet
-                        active: False
-                        on_active: app.set_notify_setting('quiet', args[1])
-
-                MDLabel:
-                    text: "Сообщения приблизительны и не обещают точное время начала дождя/снега. Оценка по прогнозу MET Norway."
-                    halign: "left"
-                    size_hint_y: None
-                    height: max(dp(28), self.texture_size[1] + dp(4))
-                    font_size: "11sp"
-                    text_size: self.width, None
-                    theme_text_color: "Custom"
-                    text_color: 0.55, 0.7, 0.55, 1
-
-            # Почасовая погода — ровно 24 карточки: текущий час + следующие 23 часа
+            # Лента «по часам» — часы текущего локального дня (сегодня)
             MDLabel:
                 id: hourly_label
-                text: "ПОЧАСОВАЯ ПОГОДА"
+                text: "Погода по часам — сегодня"
                 bold: True
                 size_hint_y: None
                 height: max(dp(20), self.texture_size[1] + dp(6))
                 theme_text_color: "Custom"
                 text_color: 0.6, 0.9, 0.6, 1
+
+            MDLabel:
+                text: "Прошедшие часы (приглушены) — сохранённый прогноз, не наблюдения"
+                font_size: "11sp"
+                size_hint_y: None
+                height: max(dp(14), self.texture_size[1] + dp(2))
+                theme_text_color: "Custom"
+                text_color: 0.45, 0.55, 0.45, 1
 
             MDScrollView:
                 id: hourly_scroll
@@ -2823,12 +3323,14 @@ class WildVantage(MDApp):
         self.cache_file = CACHE_FILE
         self.fav_file = FAV_FILE
         self.favorites = load_favorites(self.fav_file)
+        self.gps_file = GPS_FILE
         self.notify_file = NOTIFY_SETTINGS_FILE
         try:
             self.notify_settings = load_settings(self.notify_file)
         except Exception:
             self.notify_settings = dict(DEFAULT_SETTINGS)
         self._cities_open = False          # экран «Управление городами» открыт
+        self._settings_open = False        # экран «Настройки» открыт
         self._fav_refresh_active = False   # идёт фоновое освежение снимков
         self._fav_refresh_queue = []
         self.is_wilderness = False
@@ -2840,6 +3342,19 @@ class WildVantage(MDApp):
         self._loc_name = ""
         self._loc_name_coords = ""    # ключ координат владельца текущего названия
         self._loc_tz = None           # IANA-пояс места (из геокодера/кэша)
+        # ТЗ5/ТЗ6: отдельный снимок GPS-места — переключение на город НЕ
+        # должно подменять содержимое GPS-карточки (она про текущее место).
+        self._update_source = None    # gps / city / search — источник обновления
+        self._gps_weather = None
+        self._gps_coords = None
+        self._gps_name = ""
+        self._gps_last_success = None
+        # Независимый постоянный GPS-кэш: восстанавливаем сразу, не глядя
+        # на выбранный город/основной кэш (Задача №1).
+        self._load_gps_cache()
+        # История часов по городам: прошедшие часы текущего дня сохраняются
+        # при обновлении прогноза (ТЗ4), но не смешиваются между городами.
+        self._hours_history = {}
         self._geocode_fb = False      # уже был резервный геокодер в этом поиске
         self._net_check_busy = False  # идёт диагностика сети
         self._net_dialog = None       # открытый диалог диагностики
@@ -2852,6 +3367,9 @@ class WildVantage(MDApp):
             self._schedule_bg_updates()
         self._set_safe_areas()
         self._start_gen = self._gen
+        # Геомагнитная активность: реальные данные NOAA SWPC (отдельно от
+        # погодных факторов MET). Не влияет на цепочку погодных запросов.
+        self.fetch_geomag()
         Clock.schedule_once(self._safe_start, 2)
         Clock.schedule_once(self._sync_notify_ui, 0)
         # Подхват кэша, пока приложение открыто: фоновый Java-воркер
@@ -2865,6 +3383,12 @@ class WildVantage(MDApp):
         # Вернулись из фона: если фон успел записать более свежий кэш —
         # показываем его сразу (нет in-flight запроса и нет GPS-сессии).
         self._maybe_sync_from_cache()
+        # Освежаем геомагнитную активность (Kp меняется раз в 3 ч).
+        self.fetch_geomag()
+        # Гарантируем фоновое расписание после возврата (и после force-stop/
+        # перезагрузки): unique work + KEEP — идемпотентно, дублей нет.
+        if platform == "android":
+            self._schedule_bg_updates()
 
     def _maybe_sync_from_cache(self, *args):
         """Синхронизация UI с кэшем: читаем только более свежие данные."""
@@ -2883,6 +3407,16 @@ class WildVantage(MDApp):
         except Exception:
             return
         if not record_newer_than_success(record, getattr(self, "_last_success", None)):
+            return
+        # ТЗ6: не подменяем экран ЧУЖИМ городом. Если кэш сейчас для другого
+        # места, чем показано (self._last_coords), — не перечитываем его на
+        # экран (пользователь уже выбрал другой город). Сам кэш при этом мог
+        # освежиться фоном для фона — оставляем файл как есть.
+        shown = bg_valid_coords(getattr(self, "_last_coords", None))
+        rec_c = bg_valid_coords(record.get("coords") if isinstance(record, dict) else None)
+        if shown is not None and rec_c is not None and not coords_near(
+                rec_c[0], rec_c[1], shown[0], shown[1], dist=0.05):
+            self.log("sync: кэш для другого города — экран не трогаем")
             return
         self.log("sync: кэш новее показанного — перечитываем")
         try:
@@ -2927,13 +3461,17 @@ class WildVantage(MDApp):
         try:
             from android.permissions import request_permissions, Permission
 
-            request_permissions(
-                [
-                    Permission.ACCESS_FINE_LOCATION,
-                    Permission.ACCESS_COARSE_LOCATION,
-                    Permission.INTERNET,
-                ]
-            )
+            perms = [
+                Permission.ACCESS_FINE_LOCATION,
+                Permission.ACCESS_COARSE_LOCATION,
+                Permission.INTERNET,
+            ]
+            # Android 13+: разрешение на уведомления запрашиваем сразу на
+            # старте, иначе первый же фоновый прогноз не покажет пост.
+            post = getattr(Permission, "POST_NOTIFICATIONS", None)
+            if post:
+                perms.append(post)
+            request_permissions(perms)
         except Exception:
             pass
 
@@ -3127,6 +3665,10 @@ class WildVantage(MDApp):
 
     def _set_location_name(self, name):
         self._loc_name = name or ""
+        # Название GPS-места храним отдельно: после переключения на город
+        # общий _loc_name — это уже город, а GPS-карточка не должна меняться.
+        if getattr(self, "_update_source", None) == "gps":
+            self._gps_name = self._loc_name
         try:
             self.root.ids.loc_label.text = name or "Точка GPS"
         except Exception:
@@ -3512,7 +4054,9 @@ class WildVantage(MDApp):
             # всё равно обновится, только по проверенному месту.
             if getattr(self, "_gps_from_card", False):
                 self._gps_from_card = False
-                prev = self._last_coords or {}
+                # Только координаты GPS-места: _last_coords мог быть
+                # последним выбранным городом (чужие координаты).
+                prev = getattr(self, "_gps_coords", None) or {}
                 if prev.get("lat") is not None and prev.get("lon") is not None:
                     self._set_status(
                         "GPS недоступен: показаны данные по последним координатам")
@@ -3539,29 +4083,67 @@ class WildVantage(MDApp):
     def start_update(self, lat, lon, accuracy=None, source="gps", display_name=None, timeout=None):
         self._gen += 1
         gen = self._gen
+        # Источник текущего обновления: нужен, чтобы отличить GPS-снимок от
+        # выбранного города (карточка GPS не должна показывать чужой город).
+        self._update_source = source
+        # Прежний показ нужен, чтобы не стирать снимок ТОЙ ЖЕ GPS-точки на
+        # время запроса: сохранённые данные видны мгновенно и офлайн.
+        prev_weather = self._last_weather
+        prev_coords = self._last_coords
         self._last_weather = None
         self._fetch_inflight = True
         self._last_coords = {"lat": lat, "lon": lon, "accuracy": accuracy}
+        if source == "gps":
+            # Существенный переезд: снимок прежней точки — уже чужая
+            # погода. Сбрасываем его ДО запроса, чтобы карточка не выдавала
+            # старую температуру за новое место (Задача №1).
+            prev_gps = getattr(self, "_gps_coords", None)
+            same_gps = False
+            if (isinstance(prev_gps, dict)
+                    and prev_gps.get("lat") is not None
+                    and prev_gps.get("lon") is not None):
+                same_gps = coords_near(prev_gps["lat"], prev_gps["lon"],
+                                       lat, lon, dist=GPS_MOVE_DIST)
+                if not same_gps:
+                    self._drop_gps_snapshot()
+            if not same_gps:
+                # Пояс прежнего города/точки к новому месту не относится.
+                self._loc_tz = None
+            else:
+                # Та же GPS-точка: пояс берём из ЕЁ снимка, не из города.
+                gw = getattr(self, "_gps_weather", None)
+                wtz = gw.get("timezone") if isinstance(gw, dict) else None
+                self._loc_tz = (wtz if isinstance(wtz, str) and wtz
+                                and wtz != "device" else None)
+            self._gps_coords = {"lat": lat, "lon": lon, "accuracy": accuracy}
         self._set_coords_text(lat, lon, accuracy)
+        keep_shown = False
+        if source == "gps" and isinstance(prev_weather, dict) \
+                and prev_weather.get("daily"):
+            pc = bg_valid_coords(prev_coords)
+            if pc is not None and coords_near(pc[0], pc[1], lat, lon,
+                                             dist=GPS_MOVE_DIST):
+                keep_shown = True
         try:
             root = self.root.ids
-            root.forecast_list.clear_widgets()
-            root.hourly_row.clear_widgets()
-            root.main_temp.text = "--°"
-            root.feels_label.text = "--°"
-            root.humidity_label.text = "--%"
-            root.wind_label.text = "-- м/с"
-            self._set_id_text(root, "wind_kmh_label", "-- км/ч")
-            self._set_id_text(root, "temp_min_big", "--°")
-            self._set_id_text(root, "now_temp_label", "Сейчас: --°")
-            root.sunrise_label.text = "--:--"
-            root.sunset_label.text = "--:--"
-            root.current_desc_label.text = "Загрузка..."
-            root.current_icon.icon = "update"
-            root.meteoindex_label.text = "Метеоиндекс: н/д"
-            root.meteoindex_label.text_color = (0.75, 0.85, 0.75, 1)
-            self._set_id_icon(root, "meteoindex_icon", "brain",
-                               (0.75, 0.85, 0.75, 1))
+            if not keep_shown:
+                root.forecast_list.clear_widgets()
+                root.hourly_row.clear_widgets()
+                root.main_temp.text = "--°"
+                root.feels_label.text = "--°"
+                root.humidity_label.text = "--%"
+                root.wind_label.text = "-- м/с"
+                self._set_id_text(root, "wind_kmh_label", "-- км/ч")
+                self._set_id_text(root, "temp_min_big", "--°")
+                self._set_id_text(root, "now_temp_label", "Сейчас: --°")
+                root.sunrise_label.text = "--:--"
+                root.sunset_label.text = "--:--"
+                root.current_desc_label.text = "Загрузка..."
+                root.current_icon.icon = "update"
+                root.meteoindex_label.text = "Погодные факторы: н/д"
+                root.meteoindex_label.text_color = (0.75, 0.85, 0.75, 1)
+                self._set_id_icon(root, "meteoindex_icon", "brain",
+                                   (0.75, 0.85, 0.75, 1))
         except Exception:
             pass
         self._meteo_dialog_text = None
@@ -3571,11 +4153,20 @@ class WildVantage(MDApp):
             self._set_name_coords_key(lat, lon)
         else:
             if not self._name_matches_coords(lat, lon):
-                self._set_location_name(None)
-                try:
-                    self.root.ids.loc_label.text = "Определяю место..."
-                except Exception:
-                    pass
+                # Для GPS-точки сохраняем ЕЁ название (не сбрасываем в пусто
+                # при возврате с города): карточка и офлайн-показ должны
+                # называть место, а не «Кэш»/координаты.
+                saved_gps_name = ((getattr(self, "_gps_name", "") or "")
+                                  if source == "gps" else "")
+                if saved_gps_name:
+                    self._set_location_name(saved_gps_name)
+                    self._set_name_coords_key(lat, lon)
+                else:
+                    self._set_location_name(None)
+                    try:
+                        self.root.ids.loc_label.text = "Определяю место..."
+                    except Exception:
+                        pass
             # Те же координаты — прежнее название остаётся на экране, пока
             # Nominatim не уточнит его заново (защита «название пропало»).
             self.reverse_geocode(lat, lon, gen)
@@ -3718,6 +4309,21 @@ class WildVantage(MDApp):
             return
         coords = coords if isinstance(coords, dict) else (self._last_coords or {})
         cur = weather.get("current") or {}
+        # ТЗ4: история прошедших часов текущего дня ЭТОГО города не теряется
+        # при обновлении/чтении кэша (новый прогноз начинается с текущего
+        # часа). История ищется по городу: память -> снимок избранного ->
+        # независимый GPS-кэш. Прошедшие часы других дней не переносятся.
+        try:
+            merged = merge_hours_history(
+                self._hours_history_for(coords, allow_snapshots=from_cache),
+                weather.get("hours") or [],
+                cur.get("time"),
+            )
+            if merged:
+                weather["hours"] = merged
+            self._remember_hours_history(coords, weather.get("hours") or [])
+        except Exception as e:
+            self._log_exc("hours history", e)
         days = weather.get("daily") or []
         is_day = True
         try:
@@ -3727,7 +4333,11 @@ class WildVantage(MDApp):
         desc, icon = weather_info(cur.get("code"), is_day)
         self.log("display: is_day=", is_day, "desc=", desc, "icon=", icon)
         meteo = weather.get("meteo")
-        self._meteo_dialog_text = meteo_dialog_text(meteo)
+        self._meteo = meteo
+        # Общий диалог: ДВА отдельных раздела (геомагнетизм NOAA + погодные
+        # факторы MET). Не смешиваем в один «медицинский индекс».
+        self._meteo_dialog_text = activity_dialog_text(
+            getattr(self, "_geomag", None), meteo)
 
         try:
             root = self.root.ids
@@ -3752,7 +4362,7 @@ class WildVantage(MDApp):
             try:
                 lbl = root.meteoindex_label
                 if isinstance(meteo, dict):
-                    lbl.text = "Метеоиндекс: " + str(
+                    lbl.text = "Погодные факторы: " + str(
                         meteo.get("label") or "н/д")
                     lbl.text_color = {
                         "низкий": (0.4, 0.9, 0.5, 1),
@@ -3760,13 +4370,15 @@ class WildVantage(MDApp):
                         "высокий": (1, 0.55, 0.45, 1),
                     }.get(meteo.get("level"), (0.75, 0.85, 0.75, 1))
                 else:
-                    lbl.text = "Метеоиндекс: н/д"
+                    lbl.text = "Погодные факторы: н/д"
                     lbl.text_color = (0.75, 0.85, 0.75, 1)
                 # Иконка MDI brain; цвет — как у текста по уровню
                 self._set_id_icon(root, "meteoindex_icon", "brain",
                                   getattr(lbl, "text_color", None))
             except Exception:
                 pass
+            # Отдельный раздел «Геомагнитная активность» (NOAA SWPC).
+            self._apply_geomag_ui()
             if coords.get("lat") is not None and coords.get("lon") is not None:
                 self._set_coords_text(coords["lat"], coords["lon"], coords.get("accuracy"))
             if self._loc_name:
@@ -3781,11 +4393,20 @@ class WildVantage(MDApp):
                 self._favorite_sync_weather(weather, coords)
             except Exception as e:
                 self._log_exc("fav sync", e)
+            # Отдельный снимок GPS-места (только для обновлений из GPS).
+            try:
+                self._remember_gps_snapshot(weather, coords)
+            except Exception as e:
+                self._log_exc("gps snapshot", e)
 
         self._fill_hours(
-            slice_hours(weather.get("hours") or [], cur.get("time")),
+            weather.get("hours") or [],
             cur.get("time"),
         )
+        try:
+            self._update_hourly_label(cur.get("time"), weather)
+        except Exception as e:
+            self._log_exc("hourly label", e)
 
         if days:
             today = days[0]
@@ -3827,10 +4448,66 @@ class WildVantage(MDApp):
             pass
         try:
             from kivymd.uix.dialog import MDDialog
-            self._meteo_dialog = MDDialog(title="Метеоиндекс", text=text)
+            self._meteo_dialog = MDDialog(
+                title="Активность и погодные факторы", text=text)
             self._meteo_dialog.open()
         except Exception as e:
             self._log_exc("meteo dialog", e)
+
+    def geomag_touch(self, label, touch):
+        """Тап по блоку геомагнитной активности -> общий диалог (2 раздела)."""
+        try:
+            if label.collide_point(*touch.pos):
+                self.show_meteo_dialog()
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _apply_geomag_ui(self):
+        """Показать геомагнитную активность (реальные данные NOAA SWPC)."""
+        try:
+            root = self.root.ids
+            g = getattr(self, "_geomag", None)
+            lbl = getattr(root, "geomag_label", None)
+            if lbl is None:
+                return
+            lbl.text = geomag_line(g)
+            key = g.get("level") if isinstance(g, dict) else None
+            color = {
+                "g1": (1, 0.85, 0.3, 1), "g2": (1, 0.7, 0.3, 1),
+                "g3": (1, 0.55, 0.3, 1), "g4": (1, 0.45, 0.35, 1),
+                "g5": (1, 0.35, 0.35, 1),
+            }.get(key, (0.75, 0.85, 0.75, 1))
+            lbl.text_color = color
+            self._set_id_icon(root, "geomag_icon", "earth", color)
+            # Пересобрать общий диалог с учётом свежего Kp.
+            self._meteo_dialog_text = activity_dialog_text(
+                g, getattr(self, "_meteo", None))
+        except Exception:
+            pass
+
+    def fetch_geomag(self):
+        """Запрос реального планетарного Kp-индекса (NOAA SWPC).
+
+        Отдельный запрос — не влияет на цепочку MET и счётчики погодных
+        запросов. Без сети/ошибка -> просто остаётся «н/д» (не выдумываем).
+        """
+        def success(_req, result):
+            g = parse_kp_index(result)
+            if g is not None:
+                self._geomag = g
+                self.log("geomag: Kp =", g.get("kp"), g.get("label"))
+                self._apply_geomag_ui()
+
+        def error(_req, err):
+            self.log("geomag error:", err)
+
+        try:
+            self._fetch(GEOMAG_URL, on_success=success, on_error=error,
+                        timeout=12, headers={"Accept": "application/json"})
+        except Exception as e:
+            self._log_exc("geomag fetch", e)
 
     # --- ЭКРАН «УПРАВЛЕНИЕ ГОРОДАМИ» ---
     def open_cities_screen(self, *args):
@@ -3878,6 +4555,46 @@ class WildVantage(MDApp):
             ms.disabled = False
         except Exception as e:
             self._log_exc("close cities", e)
+
+    def open_settings_screen(self, *args):
+        """⚙️: открыть экран «Настройки» (погодные уведомления)."""
+        self.close_cities_screen()
+        try:
+            ids = self.root.ids
+            sv = ids.settings_view
+            sv.size_hint_y = 1
+            sv.opacity = 1
+            sv.disabled = False
+            ms = ids.main_scroll
+            ms.size_hint_y = 0
+            ms.height = 0
+            ms.opacity = 0
+            ms.disabled = True
+            self._settings_open = True
+        except Exception as e:
+            self._log_exc("open settings", e)
+            return
+        try:
+            self._sync_notify_ui()
+        except Exception as e:
+            self._log_exc("settings sync", e)
+
+    def close_settings_screen(self, *args):
+        """«←»: закрыть «Настройки», вернуться на главный экран."""
+        self._settings_open = False
+        try:
+            ids = self.root.ids
+            sv = ids.settings_view
+            sv.size_hint_y = 0
+            sv.height = 0
+            sv.opacity = 0
+            sv.disabled = True
+            ms = ids.main_scroll
+            ms.size_hint_y = 1
+            ms.opacity = 1
+            ms.disabled = False
+        except Exception as e:
+            self._log_exc("close settings", e)
 
     def add_city_from_search(self, *args):
         """Кнопка «+»: назад к поиску города, фокус в поле ввода."""
@@ -3985,8 +4702,14 @@ class WildVantage(MDApp):
         if isinstance(snap, dict) and snap.get("daily"):
             # Кэш города — на экран немедленно; свежий ответ придёт позже
             self._last_weather = snap
+            # «Обновлено: HH:MM» — собственное время ЭТОГО города, а не
+            # предыдущего показанного (иначе города смешиваются).
+            self._last_success = favorite_success_moment(item, snap)
             self.process_weather(snap, {"lat": lat, "lon": lon}, from_cache=True)
             self._set_status(f"Город «{name}»: показ из сохранённых, обновление…")
+        else:
+            # Снимка нет: не приписываем городу чужое время обновления.
+            self._last_success = None
         self.log("fav: выбран", name, lat, lon)
         return True
 
@@ -4018,181 +4741,250 @@ class WildVantage(MDApp):
             except Exception as e:
                 self._log_exc("city card", e)
 
+    def _load_gps_cache(self):
+        """Восстановить независимый GPS-кэш (после любого перезапуска).
+
+        Не зависит от выбранного города и основного кэша: файл читается
+        всегда, если он есть. Битые/неполные данные игнорируются.
+        """
+        rec = load_gps_cache(getattr(self, "gps_file", GPS_FILE))
+        if not rec:
+            return False
+        self._gps_weather = rec["weather"]
+        self._gps_coords = dict(rec["coords"])
+        self._gps_name = rec.get("location_name") or ""
+        self._gps_last_success = rec.get("last_success")
+        return True
+
+    def _save_gps_cache(self):
+        """Записать GPS-кэш на диск (атомарно, отдельно от городов)."""
+        coords = getattr(self, "_gps_coords", None)
+        weather = getattr(self, "_gps_weather", None)
+        if not isinstance(coords, dict) or not isinstance(weather, dict):
+            return False
+        tz = getattr(self, "_loc_tz", None)
+        if not tz and isinstance(weather.get("timezone"), str) \
+                and weather.get("timezone") != "device":
+            tz = weather.get("timezone")
+        rec = gps_cache_record(
+            coords, weather, getattr(self, "_gps_name", ""), tz,
+            getattr(self, "_gps_last_success", None),
+        )
+        if rec is None:
+            return False
+        return save_gps_cache(getattr(self, "gps_file", GPS_FILE), rec)
+
+    def _drop_gps_snapshot(self):
+        """Сбросить GPS-снимок: место сменилось, старые данные уже чужие."""
+        self._gps_weather = None
+        self._gps_coords = None
+        self._gps_name = ""
+        self._gps_last_success = None
+        try:
+            clear_gps_cache(getattr(self, "gps_file", GPS_FILE))
+        except Exception as e:
+            self._log_exc("gps cache clear", e)
+
+    def _remember_gps_snapshot(self, weather, coords):
+        """Сохранить снимок погоды ТЕКУЩЕГО (GPS) места отдельно от городов.
+
+        Вызывается только для свежих ответов; пишем лишь когда обновление
+        запущено из GPS. Переключение на избранный город не трогает снимок.
+        Снимок сразу пишется в собственный файл — он переживает перезапуск
+        и не зависит от того, какой город показывался последним.
+        """
+        if getattr(self, "_update_source", None) != "gps":
+            return
+        if not isinstance(weather, dict) or not weather.get("daily"):
+            return
+        if not isinstance(coords, dict):
+            return
+        if coords.get("lat") is None or coords.get("lon") is None:
+            return
+        self._gps_weather = weather
+        self._gps_coords = dict(coords)
+        self._gps_name = getattr(self, "_loc_name", "") or ""
+        self._gps_last_success = getattr(self, "_last_success", None)
+        self._save_gps_cache()
+
     def _gps_card_state(self):
-        """Снимок данных для GPS-карточки (координаты, погода, название)."""
+        """Снимок данных для GPS-карточки — ТОЛЬКО текущее GPS-место.
+
+        Раньше здесь читались _last_coords/_last_weather, которые
+        перезаписывает select_favorite: карточка показывала выбранный город
+        под видом «текущего местоположения». Теперь отдельный снимок.
+        """
         return {
-            "coords": self._last_coords or {},
-            "weather": self._last_weather,
-            "loc_name": getattr(self, "_loc_name", "") or "Текущее местоположение",
+            "coords": getattr(self, "_gps_coords", None) or {},
+            "weather": getattr(self, "_gps_weather", None),
+            "loc_name": getattr(self, "_gps_name", "") or "Текущее местоположение",
         }
+
+    @staticmethod
+    def _hcard_label(text, font_size, color, halign="left", bold=False,
+                     width=None, row_h=None, shorten_from=None):
+        """Метка для строки карточки: фикс. высота строки, текст по центру
+        вертикали — гарантированно не вылезает за строку и не наезжает."""
+        lbl = MDLabel(
+            text=text, font_size=font_size, bold=bold, halign=halign,
+            valign="middle", shorten=True,
+            theme_text_color="Custom", text_color=color,
+            size_hint_y=None, height=row_h,
+        )
+        if shorten_from:
+            lbl.shorten_from = shorten_from
+        if width is not None:
+            lbl.size_hint_x = None
+            lbl.width = width
+        return lbl
+
+    def _build_weather_card(self, v, *, lead_icon, lead_color, is_gps=False,
+                            fav_key=None, bg=(0.1, 0.15, 0.1, 1),
+                            line=(0.2, 0.4, 0.2, 1)):
+        """Карточка города/GPS в «Управлении городами» — две явные строки.
+
+        Верхняя строка: маркер (GPS/город) + название + температура.
+        Нижняя строка: погодная иконка + описание + min/max.
+        Высота каждой строки фиксирована, метки центрируются по вертикали —
+        текст физически не может перекрыть соседа (устраняет наложения).
+        У карточки города справа отдельная кнопка удаления (не перекрывает).
+        """
+        row_h_top, row_h_bot = dp(28), dp(22)
+
+        top = MDBoxLayout(orientation="horizontal", size_hint_y=None,
+                          height=row_h_top, spacing="4dp")
+        top.add_widget(MDIcon(
+            icon=lead_icon, font_size="20sp", size_hint=(None, None),
+            size=("24dp", "24dp"), theme_text_color="Custom",
+            text_color=lead_color, valign="middle",
+        ))
+        top.add_widget(self._hcard_label(
+            v["name"], "14sp", (0.95, 1, 0.95, 1), bold=True,
+            shorten_from="right", row_h=row_h_top))
+        top.add_widget(self._hcard_label(
+            v["temp"], "17sp", (0.95, 1, 0.95, 1), halign="right",
+            bold=True, width=dp(56), row_h=row_h_top))
+
+        bottom = MDBoxLayout(orientation="horizontal", size_hint_y=None,
+                             height=row_h_bot, spacing="4dp")
+        bottom.add_widget(MDIcon(
+            icon=v["icon"], font_size="16sp", size_hint=(None, None),
+            size=("20dp", "20dp"), theme_text_color="Custom",
+            text_color=(0.8, 0.95, 0.8, 1), valign="middle",
+        ))
+        bottom.add_widget(self._hcard_label(
+            v["desc"], "12sp", (0.7, 0.9, 0.75, 1), row_h=row_h_bot))
+        bottom.add_widget(self._hcard_label(
+            f"{v['tmin']} / {v['tmax']}", "11sp", (0.65, 0.85, 0.7, 1),
+            halign="right", width=dp(56), row_h=row_h_bot))
+
+        content = MDBoxLayout(orientation="vertical", size_hint_x=1,
+                              size_hint_y=None, spacing="3dp")
+        content.add_widget(top)
+        content.add_widget(bottom)
+        content.bind(minimum_height=lambda i, mh: setattr(i, "height", mh))
+
+        card = MDCard(
+            orientation="horizontal", size_hint=(1, None),
+            padding=[dp(12), dp(7), dp(8), dp(7)], spacing="6dp",
+            radius=14, elevation=0, md_bg_color=bg, line_color=line,
+        )
+        card._is_gps = is_gps
+        card._fav_key = None if is_gps else fav_key
+        card.add_widget(content)
+
+        if not is_gps:
+            key = fav_key
+            trash = MDIconButton(
+                icon="trash-can-outline", size_hint=(None, None),
+                size=("40dp", "40dp"), pos_hint={"center_y": 0.5},
+            )
+            trash.bind(on_release=lambda *a, k=key: self.remove_favorite(k))
+            card._trash = trash
+            card.add_widget(trash)
+        else:
+            card._trash = None
+
+        # Высота карточки = контент + вертикальный padding (без minimum_height
+        # горизонтального BoxLayout, который игнорирует контент).
+        content.bind(height=lambda i, h: setattr(card, "height", h + dp(14)))
+        card.height = content.height + dp(14)
+
+        card.bind(on_touch_down=self._on_city_card_touch)
+        card.bind(on_touch_up=self._on_city_card_touch_up)
+        return card
 
     def _build_gps_card(self):
         """Карточка текущего места: всегда первая, без удаления."""
         v = gps_location_view(self._gps_card_state())
-        card = MDCard(
-            orientation="horizontal",
-            size_hint=(1, None),
-            padding=["12dp", "9dp", "6dp", "9dp"],
-            spacing="8dp",
-            radius=14,
-            elevation=0,
-            md_bg_color=(0.09, 0.16, 0.11, 1),
-            line_color=(0.25, 0.55, 0.3, 1),
+        return self._build_weather_card(
+            v, lead_icon="map-marker", lead_color=(0.6, 1, 0.7, 1),
+            is_gps=True, bg=(0.09, 0.16, 0.11, 1), line=(0.25, 0.55, 0.3, 1),
         )
-        card._fav_key = None
-        card._is_gps = True
-        card.add_widget(MDIcon(
-            icon="map-marker", font_size="24sp", size_hint=(None, None),
-            size=("28dp", "28dp"), theme_text_color="Custom",
-            text_color=(0.6, 1, 0.7, 1), valign="middle",
-        ))
-        mid = MDBoxLayout(orientation="vertical", size_hint_x=1,
-                          spacing="1dp", padding=("0dp", "0dp", "0dp", "2dp"))
-        for txt, fs, bold, col in (
-            (v["name"], "14sp", True, (0.95, 1, 0.95, 1)),
-        ):
-            lbl = MDLabel(
-                text=txt, bold=bold, font_size=fs, halign="left",
-                shorten=True, size_hint_y=None,
-                theme_text_color="Custom", text_color=col,
-            )
-            lbl.height = max(dp(17), lbl.texture_size[1] + dp(2))
-            lbl.bind(texture_size=lambda inst, ts, floor=dp(17):
-                     setattr(inst, "height", max(floor, ts[1] + dp(2))))
-            mid.add_widget(lbl)
-        row = MDBoxLayout(orientation="horizontal", size_hint_x=1,
-                          spacing="4dp")
-        row.add_widget(MDIcon(
-            icon=v["icon"], font_size="18sp", size_hint=(None, None),
-            size=("22dp", "22dp"), theme_text_color="Custom",
-            text_color=(0.75, 0.95, 0.8, 1), valign="middle",
-        ))
-        desc_lbl = MDLabel(
-            text=v["desc"], font_size="12sp", halign="left",
-            shorten=True, size_hint_y=None, valign="middle",
-            theme_text_color="Custom", text_color=(0.7, 0.9, 0.75, 1),
-        )
-        desc_lbl.height = max(dp(17), desc_lbl.texture_size[1] + dp(2))
-        desc_lbl.bind(texture_size=lambda inst, ts:
-                      setattr(inst, "height", max(dp(17), ts[1] + dp(2))))
-        row.add_widget(desc_lbl)
-        mid.add_widget(row)
-        card.add_widget(mid)
-        right = MDBoxLayout(orientation="vertical", size_hint_x=None,
-                            width="64dp", spacing="1dp")
-        for txt, fs, bold, col, floor in (
-            (v["temp"], "18sp", True, (0.95, 1, 0.95, 1), dp(24)),
-            (f"{v['tmin']} / {v['tmax']}", "11sp", False,
-             (0.65, 0.85, 0.7, 1), dp(15)),
-        ):
-            lbl = MDLabel(
-                text=txt, bold=bold, font_size=fs, halign="right",
-                size_hint_y=None, theme_text_color="Custom", text_color=col,
-            )
-            lbl.height = max(floor, lbl.texture_size[1] + dp(2))
-            lbl.bind(texture_size=lambda inst, ts, f=floor:
-                     setattr(inst, "height", max(f, ts[1] + dp(2))))
-            right.add_widget(lbl)
-        card.add_widget(right)
-        card._trash = None
-        # Тап по GPS-карточке — возврат на главный экран и обновление по месту
-        card.bind(on_touch_down=self._on_city_card_touch)
-        card.bind(on_touch_up=self._on_city_card_touch_up)
-        card.height = card.minimum_height
-        card.bind(minimum_height=lambda inst, mh: setattr(inst, "height", mh))
-        return card
 
     def select_gps_current(self, *args):
         """Тап по GPS-карточке: вернуться к погоде ТЕКУЩЕГО места.
 
-        Показывает кэш/последние данные (карточка уже отражает их), затем
-        запускает обновление: при доступном GPS — уточнение координат,
-        иначе — последние подтверждённые координаты (если GPS недоступен,
-        данные обновляются по ним же). Без координат — сообщение.
+        Координаты берутся ТОЛЬКО из независимого GPS-кэша (_gps_coords),
+        а не из _last_coords: там мог остаться последний выбранный город.
+        Сохранённый снимок показывается мгновенно (работает офлайн), затем
+        запускается уточнение GPS и обновление MET.
         """
-        coords = self._last_coords or {}
-        lat, lon = coords.get("lat"), coords.get("lon")
-        if lat is None or lon is None:
-            self._set_status("Местоположение недоступно")
-            return False
+        gc = getattr(self, "_gps_coords", None) or {}
+        lat, lon = gc.get("lat"), gc.get("lon")
+        last = self._last_coords or {}
+        if (lat is None or lon is None) \
+                and getattr(self, "_update_source", None) == "gps" \
+                and last.get("lat") is not None and last.get("lon") is not None:
+            # Первый запуск без GPS-файла: берём координаты, только если
+            # они действительно пришли из GPS (не из выбранного города).
+            gc = {"lat": last["lat"], "lon": last["lon"]}
+            lat, lon = gc["lat"], gc["lon"]
         try:
             self.close_cities_screen()
         except Exception:
             pass
-        self._set_status("Обновляю погоду в текущем месте…")
+        # Время обновления — своё у GPS-места (не выбранного города).
+        gps_ls = getattr(self, "_gps_last_success", None)
+        snap = getattr(self, "_gps_weather", None)
+        have_snap = (lat is not None and lon is not None
+                     and isinstance(snap, dict) and bool(snap.get("daily")))
+        if have_snap:
+            # Мгновенный показ собственного снимка GPS (без сети).
+            if gps_ls:
+                self._last_success = gps_ls
+            self._last_weather = snap
+            self._last_coords = {"lat": lat, "lon": lon}
+            tz = snap.get("timezone") if isinstance(snap, dict) else None
+            # Пояс GPS-места, а не последнего выбранного города.
+            self._loc_tz = (tz if isinstance(tz, str) and tz
+                            and tz != "device" else None)
+            self._set_location_name(
+                getattr(self, "_gps_name", "") or "Текущее местоположение")
+            self.process_weather(snap, {"lat": lat, "lon": lon}, from_cache=True)
+            self._set_status(
+                "Текущее место: показаны сохранённые данные, обновление…")
+        else:
+            self._set_status("Определяю текущее местоположение…")
         # При рабочем GPS — уточнение координат (свежий MET после фиксы);
-        # иначе — обновление по последним подтверждённым координатам.
+        # иначе — обновление по сохранённым координатам GPS-места.
         if gps is not None:
             self._gps_from_card = True
             self.run_gps_logic()
-        else:
+            return True
+        if lat is not None and lon is not None:
             self.start_update(lat, lon, source="gps", timeout=15)
-        return True
+            return True
+        self._set_status("Местоположение недоступно")
+        return False
 
     def _build_city_card(self, item):
         v = favorite_city_view(item)
-        card = MDCard(
-            orientation="horizontal",
-            size_hint=(1, None),
-            padding=["12dp", "9dp", "6dp", "9dp"],
-            spacing="8dp",
-            radius=14,
-            elevation=0,
-            md_bg_color=(0.1, 0.15, 0.1, 1),
-            line_color=(0.2, 0.4, 0.2, 1),
+        return self._build_weather_card(
+            v, lead_icon="city-variant", lead_color=(0.85, 1, 0.85, 1),
+            is_gps=False, fav_key=item.get("key"),
+            bg=(0.1, 0.15, 0.1, 1), line=(0.2, 0.4, 0.2, 1),
         )
-        card._fav_key = item.get("key")
-        card.add_widget(MDIcon(
-            icon=v["icon"], font_size="24sp", size_hint=(None, None),
-            size=("28dp", "28dp"), theme_text_color="Custom",
-            text_color=(0.85, 1, 0.85, 1), valign="middle",
-        ))
-        mid = MDBoxLayout(orientation="vertical", size_hint_x=1,
-                          spacing="1dp", padding=("0dp", "0dp", "0dp", "2dp"))
-        for txt, fs, bold, col in (
-            (v["name"], "14sp", True, (0.95, 1, 0.95, 1)),
-            (v["desc"], "12sp", False, (0.7, 0.88, 0.7, 1)),
-        ):
-            lbl = MDLabel(
-                text=txt, bold=bold, font_size=fs, halign="left",
-                shorten=True, size_hint_y=None,
-                theme_text_color="Custom", text_color=col,
-            )
-            lbl.height = max(dp(17), lbl.texture_size[1] + dp(2))
-            lbl.bind(texture_size=lambda inst, ts, floor=dp(17):
-                     setattr(inst, "height", max(floor, ts[1] + dp(2))))
-            mid.add_widget(lbl)
-        card.add_widget(mid)
-        right = MDBoxLayout(orientation="vertical", size_hint_x=None,
-                            width="64dp", spacing="1dp")
-        for txt, fs, bold, col, floor in (
-            (v["temp"], "18sp", True, (0.95, 1, 0.95, 1), dp(24)),
-            (f"{v['tmin']} / {v['tmax']}", "11sp", False,
-             (0.65, 0.82, 0.65, 1), dp(15)),
-        ):
-            lbl = MDLabel(
-                text=txt, bold=bold, font_size=fs, halign="right",
-                size_hint_y=None, theme_text_color="Custom", text_color=col,
-            )
-            lbl.height = max(floor, lbl.texture_size[1] + dp(2))
-            lbl.bind(texture_size=lambda inst, ts, f=floor:
-                     setattr(inst, "height", max(f, ts[1] + dp(2))))
-            right.add_widget(lbl)
-        card.add_widget(right)
-        trash = MDIconButton(
-            icon="trash-can-outline", size_hint=(None, None),
-            size=("40dp", "40dp"), pos_hint={"center_y": 0.5},
-        )
-        key = item.get("key")
-        trash.bind(on_release=lambda *a, k=key: self.remove_favorite(k))
-        card._trash = trash
-        card.add_widget(trash)
-        # Тап по карточке (без области корзины) — переключение на город
-        card.bind(on_touch_down=self._on_city_card_touch)
-        card.bind(on_touch_up=self._on_city_card_touch_up)
-        card.height = card.minimum_height
-        card.bind(minimum_height=lambda inst, mh: setattr(inst, "height", mh))
-        return card
 
     def _on_city_card_touch(self, card, touch):
         try:
@@ -4287,6 +5079,18 @@ class WildVantage(MDApp):
                 w = normalize_metno(result, tz=item.get("timezone"),
                                     lat=lat, lon=lon)
                 if isinstance(w, dict) and w.get("daily"):
+                    # Прошедшие часы текущего дня не стираем при фоновом
+                    # освежении карточки (история — из её же снимка).
+                    try:
+                        prev = item.get("weather")
+                        prev_hours = (prev.get("hours")
+                                      if isinstance(prev, dict) else None)
+                        if prev_hours:
+                            w["hours"] = merge_hours_history(
+                                prev_hours, w.get("hours") or [],
+                                (w.get("current") or {}).get("time"))
+                    except Exception:
+                        pass
                     item["weather"] = w
                     item["weather_at"] = int(time.time())
                     save_favorites(self.fav_file, self.favorites)
@@ -4303,13 +5107,115 @@ class WildVantage(MDApp):
         self._fetch(url, on_success=success, on_error=error,
                     timeout=15, headers=headers)
 
-    def _fill_hours(self, hours, current_time=None):
-        """Строит ленту «ПОЧАСОВАЯ ПОГОДА»: ровно 24 карточки.
+    def _hours_history_for(self, coords, allow_snapshots=True):
+        """Прежние часы ЭТОГО города (память -> снимок -> GPS-кэш).
 
-        Первый элемент — текущий локальный час (подписан «Сейчас»),
-        далее следующие 23 часа (переход через полночь поддержан).
-        Прошедшие часы в UI не отображаются; после обновления лента
-        стоит в начале (scroll_x = 0) — автоскролл не нужен.
+        После перезапуска память пуста, но у избранного города и в
+        независимом GPS-кэше сохранён снимок с часами — поэтому история
+        прошедших часов переживает перезапуск и не берётся у чужого города.
+        allow_snapshots=False — для СВЕЖЕГО ответа: берём только часы,
+        уже показанные в этом сеансе, а не целодневный прогноз из чужого
+        сохранённого снимка (иначе вечерний первый запуск «вспоминал» бы
+        утро, которого приложение не показывало).
+        """
+        key = self._city_key_for(coords)
+        if not key:
+            return []
+        hist = getattr(self, "_hours_history", None) or {}
+        saved = hist.get(key)
+        if saved:
+            return list(saved)
+        if not allow_snapshots:
+            return []
+        for item in getattr(self, "favorites", []) or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                item_key = item.get("key") or fav_key(item.get("lat"),
+                                                       item.get("lon"))
+            except Exception:
+                continue
+            if item_key != key:
+                continue
+            w = item.get("weather")
+            if isinstance(w, dict) and w.get("hours"):
+                return list(w["hours"])
+        gc = getattr(self, "_gps_coords", None)
+        gw = getattr(self, "_gps_weather", None)
+        if isinstance(gc, dict) and isinstance(gw, dict) and gw.get("hours"):
+            try:
+                gkey = fav_key(gc.get("lat"), gc.get("lon"))
+            except Exception:
+                gkey = None
+            if gkey == key:
+                return list(gw["hours"])
+        return []
+
+    @staticmethod
+    def _city_key_for(coords):
+        if not isinstance(coords, dict):
+            return None
+        lat, lon = coords.get("lat"), coords.get("lon")
+        if lat is None or lon is None:
+            return None
+        return fav_key(lat, lon)
+
+    def _remember_hours_history(self, coords, hours):
+        """Запомнить часы города (ограниченно, чтобы память не росла).
+
+        Более старые сутки не должны затирать более новые (например, после
+        полуночи пришёл вчерашний кэш): сравниваем последний час записей.
+        """
+        key = self._city_key_for(coords)
+        if not key or not isinstance(hours, list) or not hours:
+            return
+        hist = getattr(self, "_hours_history", None)
+        if not isinstance(hist, dict):
+            hist = {}
+            self._hours_history = hist
+        new_last = max((str(h.get("time") or "") for h in hours
+                        if isinstance(h, dict)), default="")
+        old = hist.get(key) or []
+        old_last = max((str(h.get("time") or "") for h in old
+                        if isinstance(h, dict)), default="")
+        if old_last and new_last and new_last < old_last:
+            return
+        hist[key] = list(hours)
+        if len(hist) > 8:
+            # Удаляем самую старую запись (dict сохраняет порядок вставки).
+            for old_key in list(hist.keys())[:-8]:
+                hist.pop(old_key, None)
+
+    def _update_hourly_label(self, current_time, weather=None):
+        """Подпись ленты: «сегодня» только если это действительно сегодня.
+
+        Кэш, снятый вчера, показывается с явной датой — иначе прошедшие
+        часы выглядели бы как прогноз на текущие сутки.
+        """
+        try:
+            lbl = self.root.ids.hourly_label
+        except Exception:
+            return
+        day = str(current_time or "")[:10]
+        today = city_today_iso(weather)
+        if day and len(day) == 10 and day != today:
+            try:
+                d = datetime.strptime(day, "%Y-%m-%d")
+                lbl.text = ("Погода по часам — сохранённый прогноз ("
+                            + d.strftime("%d.%m") + ")")
+            except Exception:
+                lbl.text = "Погода по часам — сохранённый прогноз"
+        else:
+            lbl.text = "Погода по часам — сегодня"
+
+    def _fill_hours(self, hours, current_time=None):
+        """Строит ленту «Погода по часам — сегодня»: часы локального дня.
+
+        Показываются все часы текущих суток города (00:00–23:00), включая
+        уже прошедшие — они приглушены и подписаны как сохранённый прогноз
+        (не фактические наблюдения). Текущий час подсвечен. День с переходом
+        на летнее/зимнее время даёт 23 или 25 карточек — ровно сколько есть
+        в данных, без выдумывания.
         """
         try:
             row = self.root.ids.hourly_row
@@ -4317,11 +5223,19 @@ class WildVantage(MDApp):
         except Exception:
             return
         if current_time:
-            hours = slice_hours(hours, current_time, count=24)
+            hours = hours_for_local_day(hours, current_time)
         else:
             hours = (list(hours) if hours else [])[:24]
         row.clear_widgets()
-        for h in hours[:24]:
+        if current_time and not hours:
+            # Данных за текущие сутки города нет (например, первый запуск
+            # вечером, а прогноз начинается с завтрашнего дня). Погоду за
+            # прошедшие часы НЕ придумываем — показываем честную заглушку.
+            try:
+                self._build_hour_placeholder(row)
+            except Exception as e:
+                self._log_exc("hour placeholder", e)
+        for h in hours[:26]:
             try:
                 self._build_hour_cell(row, h, current_time)
             except Exception as e:
@@ -4330,6 +5244,37 @@ class WildVantage(MDApp):
             scroll.scroll_x = 0
         except Exception:
             pass
+        try:
+            scroll.scroll_x = 0
+        except Exception:
+            pass
+
+    def _build_hour_placeholder(self, row):
+        """Заглушка ленты часов: за текущие сутки данных нет.
+
+        Ничего не выдумываем: сообщаем, что прогноза на сегодня в
+        сохранённых данных нет (например, приложение впервые открыто
+        вечером и модель начинается с завтрашнего дня).
+        """
+        box = MDBoxLayout(
+            orientation="horizontal",
+            size_hint=(None, None),
+            width=dp(196),
+            height=dp(88),
+            padding=(dp(6), 0),
+        )
+        label = MDLabel(
+            text="Нет данных\nза сегодня",
+            font_size="12sp",
+            halign="left",
+            valign="middle",
+            size_hint=(1, 1),
+            theme_text_color="Custom",
+            text_color=(0.65, 0.75, 0.65, 1),
+        )
+        label.bind(size=lambda inst, s: setattr(inst, "text_size", (s[0], None)))
+        box.add_widget(label)
+        row.add_widget(box)
 
     def _build_hour_cell(self, row, h, current_time=None):
         time_iso = str(h.get("time") or "")
@@ -4539,14 +5484,25 @@ class WildVantage(MDApp):
             "weather": self._last_weather,
             "last_success": getattr(self, "_last_success", None),
             "saved_at": datetime.now().strftime("%d.%m %H:%M"),
+            # Источник данных: по нему после перезапуска восстанавливается
+            # отдельный снимок GPS-места (а не выбранный город).
+            "source": getattr(self, "_update_source", None) or "gps",
         }
         # Write-if-newer: более свежий файл (фоновое обновление) не затираем.
+        # ТЗ6: это правило действует ТОЛЬКО для того же города. Если в кэше
+        # сейчас другой город (фон обновлял его, пока мы смотрели избранное) —
+        # пишем всё равно, иначе свежий ответ нового города молча теряется.
         existing = self._read_cache_record()
         if existing is not None:
+            same_city = True
+            ex_c = bg_valid_coords(existing.get("coords"))
+            our_c = bg_valid_coords(self._last_coords)
+            if ex_c is not None and our_c is not None:
+                same_city = coords_near(ex_c[0], ex_c[1], our_c[0], our_c[1], dist=0.05)
             ex_unix = record_success_unix(existing)
             our_ls = getattr(self, "_last_success", None)
             our_unix = our_ls.get("unix") if isinstance(our_ls, dict) else None
-            if ex_unix is not None and (our_unix is None or int(ex_unix) > int(our_unix)):
+            if same_city and ex_unix is not None and (our_unix is None or int(ex_unix) > int(our_unix)):
                 self.log("cache: файл новее — запись пропущена", ex_unix, ">", our_unix)
                 return
         # Атомарная запись: temp-файл + os.replace (читатель не увидит полфайла).
@@ -4566,6 +5522,16 @@ class WildVantage(MDApp):
                     os.remove(tmp)
             except Exception:
                 pass
+            return
+        # GPS-место обновляется в собственный файл (не зависит от города).
+        if (record.get("source") or "gps") == "gps":
+            # Название могло уточниться геокодером после ответа MET.
+            if getattr(self, "_loc_name", ""):
+                self._gps_name = self._loc_name
+            try:
+                self._save_gps_cache()
+            except Exception as e:
+                self._log_exc("gps cache save", e)
 
     def load_cache(self, gen=None, city_filter=None, show_err=False,
                    requested=None, status_msg=None):
@@ -4612,11 +5578,6 @@ class WildVantage(MDApp):
                 return fail(f"{status_msg}. Нет данных.")
             return fail("Кэш повреждён — включите интернет")
 
-        # Время успеха: не даём более старой кэш-записи откатить более свежий
-        # момент из памяти (ошибка API не меняет время последнего успеха).
-        self._last_success = pick_newer_success(
-            getattr(self, "_last_success", None), record.get("last_success")
-        )
         # Пояс места из кэша (первый запуск после геокодера/фона): чтобы
         # «Обновлено HH:MM» и дальнейшие нормализации шли по IANA-поясу,
         # а не по фиксированному сдвигу устройства.
@@ -4626,10 +5587,45 @@ class WildVantage(MDApp):
         fallback_iso = (weather.get("current") or {}).get("time")
 
         is_far = bool(requested) and self._coords_far(requested, coords)
+        gps_substituted = False
         if is_far:
-            # Кэш другого места: координаты/название не подменяем на чужие,
-            # показываем текущую GPS-точку, а не прошлую локацию.
-            coords = requested
+            # Кэш другого места нельзя показывать как погоду запрошенной
+            # точки (ТЗ6/Задача №1): подставляем ТОЛЬКО независимый
+            # GPS-снимок, если он относится к этим же координатам. Иначе —
+            # честно «нет данных», экран остаётся с заглушками.
+            gw = getattr(self, "_gps_weather", None)
+            gc = getattr(self, "_gps_coords", None)
+            req_c = bg_valid_coords(requested)
+            gps_c = bg_valid_coords(gc)
+            if (isinstance(gw, dict) and gw.get("daily")
+                    and req_c is not None and gps_c is not None
+                    and coords_near(gps_c[0], gps_c[1], req_c[0], req_c[1],
+                                    dist=0.05)):
+                weather = gw
+                coords = dict(gc)
+                # Часы/статус — по поясу GPS-места, не выбранного города.
+                wtz = gw.get("timezone")
+                self._loc_tz = (wtz if isinstance(wtz, str) and wtz
+                                and wtz != "device" else None)
+                self._last_success = pick_newer_success(
+                    getattr(self, "_last_success", None),
+                    getattr(self, "_gps_last_success", None))
+                gps_substituted = True
+                is_far = False
+            else:
+                self.log("cache: другой город/точка — чужую погоду не показываем")
+                # Экран запрошенной GPS-точки: запоминаем ЕЁ координаты,
+                # чтобы фоновая синхронизация не подставила сюда кэш города.
+                self._last_weather = None
+                self._last_coords = dict(requested) if requested else None
+                self._last_success = None
+                return fail("Нет данных для этого места — включите интернет")
+        else:
+            # Время успеха: не даём более старой кэш-записи откатить более
+            # свежий момент из памяти (ошибка API не меняет время успеха).
+            self._last_success = pick_newer_success(
+                getattr(self, "_last_success", None), record.get("last_success")
+            )
         self.log("cache: чтение из файла | кэш другого места =", is_far)
         self._last_weather = weather
         self._last_coords = coords
@@ -4637,8 +5633,29 @@ class WildVantage(MDApp):
             self._set_location_name(f"{coords.get('lat', 0):.5f}, {coords.get('lon', 0):.5f}")
             self._loc_name_coords = f"{coords.get('lat', 0):.5f}, {coords.get('lon', 0):.5f}"
         else:
-            self._set_location_name(record.get("location_name") or "Кэш")
+            name = ((getattr(self, "_gps_name", "") or "Кэш")
+                    if gps_substituted else (record.get("location_name") or "Кэш"))
+            self._set_location_name(name)
             self._loc_name_coords = f"{coords.get('lat', 0):.5f}, {coords.get('lon', 0):.5f}"
+        # Восстановить отдельный снимок GPS-места (после перезапуска), если
+        # кэш относится к текущему месту и записан из GPS (старые записи без
+        # поля source считаем GPS-кэшем первого запуска). Более свежий
+        # независимый GPS-кэш старой записью не перетираем.
+        if not is_far and (record.get("source") or "gps") == "gps":
+            rec_ls = record.get("last_success")
+            cur_ls = getattr(self, "_gps_last_success", None)
+            use_rec = True
+            if isinstance(cur_ls, dict) and isinstance(rec_ls, dict):
+                try:
+                    use_rec = (int(rec_ls.get("unix") or 0)
+                               >= int(cur_ls.get("unix") or 0))
+                except Exception:
+                    use_rec = True
+            if use_rec:
+                self._gps_weather = weather
+                self._gps_coords = dict(coords)
+                self._gps_name = getattr(self, "_loc_name", "") or ""
+                self._gps_last_success = rec_ls
         self.process_weather(weather, coords, from_cache=True)
 
         note = "Данные из кэша (другое место)." if is_far else "Данные из кэша."
